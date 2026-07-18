@@ -55,7 +55,7 @@ brew install ffmpeg
 **3. Скрипт и зависимости:**
 
 ```bash
-git clone https://github.com/USERNAME/media-cleaner.git
+git clone https://github.com/ilya-konoplev/media-cleaner.git
 cd media-cleaner
 python3 -m venv .venv
 source .venv/bin/activate
@@ -93,7 +93,7 @@ ffmpeg -version
 **3. Скрипт и зависимости:**
 
 ```powershell
-git clone https://github.com/USERNAME/media-cleaner.git
+git clone https://github.com/ilya-konoplev/media-cleaner.git
 cd media-cleaner
 python -m venv .venv
 .venv\Scripts\Activate.ps1
