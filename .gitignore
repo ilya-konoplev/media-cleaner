@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Output / reports produced by runs
+reports/
+*_remux.mkv
+*_compressed_*.mp4
+*_movie_x265_*.mkv
