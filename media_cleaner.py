@@ -3239,28 +3239,58 @@ def run_wizard_movie_mkv(
     # --- step 1: choose source file(s) ---
     sources: list[Path] = []
 
+    def _add_one(resolved: Path) -> int:
+        """Append one validated file if it is not already selected."""
+        if resolved in sources:
+            print(f"Файл уже добавлен, пропускаю: {resolved.name}")
+            return 0
+        sources.append(resolved)
+        return 1
+
     def _add_candidates(line: str) -> int:
-        """Validate every path parsed from *line*, append new ones. Returns count added."""
+        """
+        Validate every path parsed from *line*, append new ones.
+
+        A dragged FOLDER is expanded to the video files directly inside it.
+        That matters because a terminal accepts at most MAX_CANON (1024 bytes
+        on macOS) per input line, so dragging a whole season at once silently
+        stops at about nine long paths. One folder path is ~60 bytes no matter
+        how many episodes it holds.
+        """
         added = 0
         for candidate in clean_terminal_paths(line):
             resolved = candidate.resolve()
+            if resolved.is_dir():
+                videos = sorted(
+                    path for path in resolved.iterdir()
+                    if path.is_file()
+                    and not path.is_symlink()
+                    and path.suffix.lower() in VIDEO_EXTENSIONS
+                )
+                if not videos:
+                    print(f"В папке нет видеофайлов: {resolved}")
+                    continue
+                print(f"Папка «{resolved.name}»: найдено видеофайлов — {len(videos)}")
+                for video in videos:
+                    added += _add_one(video)
+                continue
             if not (resolved.is_file() and not resolved.is_symlink()):
                 print(f"Файл не найден или это не обычный файл: {resolved}")
                 continue
-            if resolved in sources:
-                print(f"Файл уже добавлен, пропускаю: {resolved.name}")
-                continue
-            sources.append(resolved)
-            added += 1
+            added += _add_one(resolved)
         return added
 
+    print(
+        "\nСовет: для целого сезона перетащите ПАПКУ — будут добавлены все видео "
+        "внутри неё. Терминал принимает не больше 1024 символов в строке, "
+        "поэтому перетащить разом много файлов с длинными путями не получится."
+    )
     while True:
         file_value = input(
-            "\nПеретащите один или несколько видеофайлов в Terminal "
-            "(можно выделить сразу все) и нажмите Enter: "
+            "\nПеретащите папку или видеофайлы в Terminal и нажмите Enter: "
         )
         if not file_value.strip():
-            print("Укажите путь хотя бы к одному файлу.")
+            print("Укажите путь хотя бы к одному файлу или папке.")
             continue
         if _add_candidates(file_value) > 0:
             break
@@ -3272,7 +3302,7 @@ def run_wizard_movie_mkv(
         for i, src in enumerate(sources, start=1):
             print(f"  {i}. {src.name}")
         file_value = input(
-            "Добавить ещё файлы? Перетащите их или нажмите Enter, чтобы продолжить: "
+            "Добавить ещё? Перетащите папку или файлы, либо нажмите Enter, чтобы продолжить: "
         )
         if not file_value.strip():
             break
