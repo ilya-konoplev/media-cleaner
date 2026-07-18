@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "media-cleaner"
+version = "1.0.0"
+description = "Локальный инструмент для медиаархива: дубликаты, похожие фото и видео, сжатие и пересборка MKV с выбором дорожек"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Ilya Konoplev" }]
+keywords = ["media", "video", "ffmpeg", "duplicates", "mkv", "compression"]
+classifiers = [
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "pillow",
+    "imagehash",
+]
+
+[project.optional-dependencies]
+# HEIC support. Kept optional so a missing wheel can never break the main install.
+heic = ["pillow-heif"]
+
+[project.urls]
+Homepage = "https://github.com/ilya-konoplev/media-cleaner"
+
+[project.scripts]
+mc = "media_cleaner:main"
+media-cleaner = "media_cleaner:main"
+
+[tool.setuptools]
+py-modules = ["media_cleaner"]

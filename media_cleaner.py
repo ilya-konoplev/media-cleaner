@@ -162,6 +162,10 @@ def parse_args() -> argparse.Namespace:
     args.movie_mkv = None  # populated by run_wizard_movie_mkv if chosen
     # Duration-diff attr is set by wizard; provide a default for CLI path.
     args._similar_video_dur_diff = 0.15
+    # A bare invocation with no arguments at all starts the interactive wizard,
+    # so the installed `mc` command works without remembering any flags.
+    if len(sys.argv) == 1:
+        args.wizard = True
     if args.quick_file and (args.input is not None or args.output is not None):
         parser.error("с --quick-file не нужно указывать INPUT и OUTPUT")
     special_modes = [

@@ -52,21 +52,23 @@ python3 --version
 brew install ffmpeg
 ```
 
-**3. Скрипт и зависимости:**
+**3. Сам Media Cleaner.** Рекомендуется через [pipx](https://pipx.pypa.io/) — он ставит программу в изолированное окружение, но команда работает из любой папки:
 
 ```bash
-git clone https://github.com/ilya-konoplev/media-cleaner.git
-cd media-cleaner
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install pillow imagehash pillow-heif
+brew install pipx
+pipx ensurepath
+pipx install git+https://github.com/ilya-konoplev/media-cleaner.git
 ```
 
-**4. Проверка:**
+Закройте и снова откройте Terminal.
+
+**4. Готово.** Теперь в любой папке достаточно набрать:
 
 ```bash
-python3 media_cleaner.py --wizard
+mc
 ```
+
+Откроется пошаговый мастер. Больше ничего запоминать не нужно.
 
 ## Установка на Windows
 
@@ -90,27 +92,25 @@ ffmpeg -version
 
 Если `winget` недоступен, скачайте сборку с [ffmpeg.org](https://ffmpeg.org/download.html), распакуйте и добавьте папку `bin` в переменную среды `PATH`.
 
-**3. Скрипт и зависимости:**
+**3. Сам Media Cleaner:**
 
 ```powershell
-git clone https://github.com/ilya-konoplev/media-cleaner.git
-cd media-cleaner
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install pillow imagehash pillow-heif
+python -m pip install --user pipx
+python -m pipx ensurepath
+pipx install git+https://github.com/ilya-konoplev/media-cleaner.git
 ```
 
-Если PowerShell блокирует активацию окружения, разрешите скрипты для текущего пользователя:
+Закройте и снова откройте PowerShell.
+
+**4. Готово.** Теперь в любой папке достаточно набрать:
 
 ```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+mc
 ```
 
-**4. Проверка:**
+Откроется пошаговый мастер.
 
-```powershell
-python media_cleaner.py --wizard
-```
+> Для установки нужен ещё [git](https://git-scm.com/download/win). Если ставить его не хочется, скачайте репозиторий кнопкой **Code → Download ZIP**, распакуйте и выполните `pipx install C:\путь\к\папке`.
 
 ### Что на Windows не работает
 
@@ -126,40 +126,52 @@ python media_cleaner.py --wizard
 
 ## Использование
 
-Самый простой способ — интерактивный мастер, который проведёт по шагам:
+Просто наберите в терминале:
 
 ```bash
-python3 media_cleaner.py --wizard
+mc
 ```
 
-Мастер предложит 12 пунктов: поиск дубликатов, сжатие, поиск похожих файлов, работа с фильмами и сериалами.
+Откроется пошаговый мастер с 12 пунктами: поиск дубликатов, сжатие, поиск похожих файлов, работа с фильмами и сериалами. Флаги знать не нужно — мастер обо всём спросит сам и в конце покажет итоговые настройки перед запуском.
 
 ### Примеры для командной строки
 
+Если хочется без мастера, все режимы доступны флагами:
+
 ```bash
 # Посмотреть план, ничего не меняя
-python3 media_cleaner.py ~/Photos ~/Photos_compressed --dry-run
+mc ~/Photos ~/Photos_compressed --dry-run
 
 # Реальное сжатие
-python3 media_cleaner.py ~/Photos ~/Photos_compressed
+mc ~/Photos ~/Photos_compressed
 
 # Только найти точные дубликаты
-python3 media_cleaner.py ~/Photos ~/Report --duplicates-only
+mc ~/Photos ~/Report --duplicates-only
 
 # Перенести лишние копии (сначала с dry-run)
-python3 media_cleaner.py ~/Photos ~/Cleanup --move-duplicates --dry-run
+mc ~/Photos ~/Cleanup --move-duplicates --dry-run
 
 # Найти похожие фото построже
-python3 media_cleaner.py ~/Photos ~/Review --find-similar-photos --similar-threshold 3
+mc ~/Photos ~/Review --find-similar-photos --similar-threshold 3
 
 # Быстро сжать один файл
-python3 media_cleaner.py --quick-file ~/Movies/clip.mov --video-crf 31 --video-preset fast
+mc --quick-file ~/Movies/clip.mov --video-crf 31 --video-preset fast
 ```
 
 Полный список параметров:
 
 ```bash
-python3 media_cleaner.py --help
+mc --help
+```
+
+Если имя `mc` уже занято (например, файловым менеджером Midnight Commander), у программы есть второе имя — `media-cleaner`. Работает точно так же.
+
+### Запуск без установки
+
+Скрипт можно запускать и просто как файл, без пакета:
+
+```bash
+python3 media_cleaner.py --wizard
 ```
 
 ## Работа с сериалами
