@@ -15,3 +15,8 @@ reports/
 *_remux.mkv
 *_compressed_*.mp4
 *_movie_x265_*.mkv
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
