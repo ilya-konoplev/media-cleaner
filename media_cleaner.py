@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Safely copy and compress a media archive into a separate folder."""
+"""
+Media Cleaner: a local, safe toolkit for a personal media archive.
+
+Covers four jobs, all writing into a separate folder and never touching the
+originals: compressing photos and videos, finding exact duplicates by SHA256,
+finding visually similar photos and videos by perceptual hash, and remuxing or
+re-encoding movies and TV series into MKV with explicit audio/subtitle track
+selection. Run without arguments to open the interactive wizard.
+"""
 
 from __future__ import annotations
 
@@ -50,19 +58,26 @@ class Counters:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Безопасно сжимает медиафайлы в отдельную папку. Оригиналы не меняются.",
+        description=(
+            "Локальный инструмент для медиаархива: поиск точных дубликатов, "
+            "поиск визуально похожих фото и видео, сжатие фото и видео, "
+            "пересборка фильмов и сериалов в MKV с выбором дорожек. "
+            "Оригиналы никогда не меняются и не удаляются."
+        ),
         epilog=(
             "Примеры:\n"
-            "  python3 media_cleaner.py --wizard\n"
-            "  python3 media_cleaner.py INPUT OUTPUT --dry-run\n"
-            "  python3 media_cleaner.py INPUT OUTPUT --duplicates-only\n"
-            "  python3 media_cleaner.py INPUT OUTPUT --move-duplicates --dry-run\n"
-            "  python3 media_cleaner.py INPUT OUTPUT --review-duplicates\n"
-            "  python3 media_cleaner.py INPUT OUTPUT --find-similar-photos --similar-threshold 5\n"
-            "  python3 media_cleaner.py INPUT OUTPUT --trash-similar-from-report --dry-run\n"
-            "  python3 media_cleaner.py INPUT OUTPUT --find-similar-videos\n"
-            "  python3 media_cleaner.py INPUT OUTPUT --trash-similar-videos-from-report --dry-run\n"
-            "  python3 media_cleaner.py --quick-file /path/to/video.mov --video-crf 31 --video-preset fast"
+            "  mc --wizard\n"
+            "  mc INPUT OUTPUT --dry-run\n"
+            "  mc INPUT OUTPUT --duplicates-only\n"
+            "  mc INPUT OUTPUT --move-duplicates --dry-run\n"
+            "  mc INPUT OUTPUT --review-duplicates\n"
+            "  mc INPUT OUTPUT --find-similar-photos --similar-threshold 5\n"
+            "  mc INPUT OUTPUT --trash-similar-from-report --dry-run\n"
+            "  mc INPUT OUTPUT --find-similar-videos\n"
+            "  mc INPUT OUTPUT --trash-similar-videos-from-report --dry-run\n"
+            "  mc --quick-file /path/to/video.mov --video-crf 31 --video-preset fast\n"
+            "\n"
+            "Запуск без аргументов открывает пошаговый мастер: mc"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -143,8 +158,11 @@ def parse_args() -> argparse.Namespace:
         choices=("x265", "hevc_videotoolbox"),
         default="x265",
         help=(
-            "Видеокодек: x265 (по умолчанию, libx265 + CRF) или "
-            "hevc_videotoolbox (аппаратное HEVC, только macOS, использует --video-qp)"
+            "Видеокодек: x265 (по умолчанию) — автовыбор: на macOS будет выбран "
+            "аппаратный HEVC (hevc_videotoolbox), если ffmpeg его поддерживает, "
+            "иначе libx265 + CRF; для гарантированного libx265 добавьте "
+            "--disable-hw-video. Либо hevc_videotoolbox — явно аппаратное HEVC "
+            "(только macOS, использует --video-qp)"
         ),
     )
     parser.add_argument(
@@ -200,13 +218,45 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def _strip_surrounding_quotes(token: str) -> str:
+    token = token.strip()
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+        return token[1:-1].strip()
+    return token
+
+
+def _split_terminal_line(value: str) -> list[str]:
+    """
+    Split ONE terminal input line into raw path tokens.
+
+    The split rules differ per platform and MUST NOT be mixed up:
+
+    * POSIX (macOS, Linux): Terminal drag-and-drop backslash-escapes spaces
+      (`/Users/me/My\\ Folder`), so POSIX-mode shlex is exactly right — it
+      un-escapes the backslashes and yields one token per dragged file.
+    * Windows (os.name == "nt"): the backslash is the PATH SEPARATOR, so POSIX
+      shlex would silently eat it and turn C:\\Users\\Ilya\\Video.mkv into
+      C:UsersIlyaVideo.mkv — a wrong path with no error at all. Non-POSIX mode
+      keeps backslashes intact, but it also keeps the surrounding quotes on
+      each token, so they are stripped by hand afterwards.
+
+    Raises ValueError on an unbalanced quote (callers fall back to the raw line).
+    """
+    cleaned = value.strip()
+    if not cleaned:
+        return []
+    if os.name == "nt":
+        return [_strip_surrounding_quotes(part) for part in shlex.split(cleaned, posix=False)]
+    return shlex.split(cleaned)
+
+
 def clean_terminal_path(value: str) -> Path:
     cleaned = value.strip()
     if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", '"'}:
         cleaned = cleaned[1:-1].strip()
     else:
         try:
-            parts = shlex.split(cleaned)
+            parts = _split_terminal_line(cleaned)
             if len(parts) == 1:
                 cleaned = parts[0]
         except ValueError:
@@ -219,19 +269,28 @@ def clean_terminal_paths(value: str) -> list[Path]:
     Parse ONE terminal line that may contain SEVERAL dragged paths.
 
     macOS Terminal drops multiple files as a single space-separated line,
-    quoting or backslash-escaping any path that contains spaces. shlex.split
-    understands both forms, so each token becomes one path. Falls back to
-    treating the whole line as a single path if it can't be parsed.
+    quoting or backslash-escaping any path that contains spaces, so each token
+    becomes one path. Falls back to treating the whole line as a single path if
+    it can't be parsed, or if the line looks like one unquoted path that simply
+    contains spaces (a hand-pasted `/Users/a/My Folder`).
     """
     cleaned = value.strip()
     if not cleaned:
         return []
     try:
-        parts = shlex.split(cleaned)
+        parts = _split_terminal_line(cleaned)
     except ValueError:
         return [clean_terminal_path(cleaned)]
     if not parts:
         return []
+    if len(parts) > 1:
+        # A hand-pasted path with spaces and no quoting splits into several
+        # tokens that exist nowhere. Only then fall back to the whole line —
+        # requiring that NO token exists keeps genuine multi-file drops intact.
+        if not any(Path(part).expanduser().exists() for part in parts):
+            whole = Path(_strip_surrounding_quotes(cleaned)).expanduser()
+            if whole.exists():
+                return [whole]
     return [Path(part).expanduser() for part in parts]
 
 
@@ -283,7 +342,7 @@ def run_wizard(args: argparse.Namespace) -> argparse.Namespace | None:
     print("  8. Удалить похожие фото из отчёта в корзину")
     print("  9. Найти визуально похожие видео")
     print(" 10. Удалить похожие видео из отчёта в корзину")
-    print(" 11. Сжать один фильм в MKV с выбором аудио и субтитров")
+    print(" 11. Пересобрать фильмы/сериалы в MKV: выбор дорожек, со сжатием или без")
     print(" 12. Выйти")
     mode = prompt_menu(
         "Выберите 1-12: ",
@@ -375,10 +434,13 @@ def run_wizard(args: argparse.Namespace) -> argparse.Namespace | None:
 
         # --- codec selection for modes 2-3 ---
         print("\nКодек видео:")
-        print("  1. x265 (процессор, использует CRF) [по умолчанию]")
+        print("  1. Автоматически: аппаратный кодек, если доступен, иначе libx265 (CPU) [по умолчанию]")
         print("  2. hevc_videotoolbox (аппаратный HEVC, только macOS, использует QP)")
-        codec_choice_w = prompt_menu("Выберите 1-2 [Enter = 1]: ", {"1", "2"}, "1")
-        wizard_video_codec = "x265" if codec_choice_w == "1" else "hevc_videotoolbox"
+        print("  3. libx265 (только процессор, медленно, точный CRF)")
+        codec_choice_w = prompt_menu("Выберите 1-3 [Enter = 1]: ", {"1", "2", "3"}, "1")
+        wizard_video_codec = "hevc_videotoolbox" if codec_choice_w == "2" else "x265"
+        # Option 3 is exactly --disable-hw-video: same auto path, HW forbidden.
+        wizard_disable_hw = codec_choice_w == "3"
         if wizard_video_codec == "hevc_videotoolbox":
             if not is_macos():
                 print("Ошибка: hevc_videotoolbox доступен только на macOS. Выберите x265.",
@@ -415,6 +477,13 @@ def run_wizard(args: argparse.Namespace) -> argparse.Namespace | None:
             print(f"  Кодек: hevc_videotoolbox, q:v={wizard_video_qp}")
             print(f"  video_crf: {video_crf} (используется только для имён файлов)")
         else:
+            # Resolve the encoder NOW so the real codec is visible before YES,
+            # not only after the run starts.
+            wizard_encoder = select_video_encoder(disable_hw=wizard_disable_hw)
+            for line in quality_mode_display(
+                wizard_encoder, video_crf, video_preset, explicit_qp=None
+            ):
+                print(line)
             print(f"  video_crf: {video_crf}")
             print(f"  video_preset: {video_preset}")
         print(f"  image_quality: {image_quality}")
@@ -437,6 +506,7 @@ def run_wizard(args: argparse.Namespace) -> argparse.Namespace | None:
     if mode != "1":
         args.video_codec = wizard_video_codec
         args.video_qp = wizard_video_qp
+        args.disable_hw_video = wizard_disable_hw
     return args
 
 
@@ -725,7 +795,6 @@ def run_quick_file_mode(
         print("DRY-RUN: файл не создавался.")
         return 0
 
-    output_path = output_path
     if not reserve_destination(output_path):
         counter = 2
         while True:
@@ -903,16 +972,29 @@ def run_wizard_quick_file(args: argparse.Namespace) -> argparse.Namespace | None
             print("Укажите путь к видеофайлу.")
             continue
         source = clean_terminal_path(file_value).resolve()
-        if source.is_file() and not source.is_symlink():
-            break
-        print(f"Файл не найден: {source}")
+        if not (source.is_file() and not source.is_symlink()):
+            print(f"Файл не найден: {source}")
+            continue
+        if source.suffix.lower() not in VIDEO_EXTENSIONS:
+            # Don't reject outright — ffmpeg reads plenty of containers this
+            # list doesn't name. Just don't let the user find out after
+            # answering every question.
+            print(
+                f"Это не похоже на видеофайл (расширение «{source.suffix or 'без расширения'}»)."
+            )
+            if not prompt_yes_no("Всё равно попробовать? yes/no [no]: ", "no"):
+                continue
+        break
 
     # --- codec selection ---
     print("\nКодек видео:")
-    print("  1. x265 (процессор, использует CRF) [по умолчанию]")
+    print("  1. Автоматически: аппаратный кодек, если доступен, иначе libx265 (CPU) [по умолчанию]")
     print("  2. hevc_videotoolbox (аппаратный HEVC, только macOS, использует QP)")
-    codec_choice = prompt_menu("Выберите 1-2 [Enter = 1]: ", {"1", "2"}, "1")
-    video_codec = "x265" if codec_choice == "1" else "hevc_videotoolbox"
+    print("  3. libx265 (только процессор, медленно, точный CRF)")
+    codec_choice = prompt_menu("Выберите 1-3 [Enter = 1]: ", {"1", "2", "3"}, "1")
+    video_codec = "hevc_videotoolbox" if codec_choice == "2" else "x265"
+    # Option 3 is exactly --disable-hw-video: same auto path, HW forbidden.
+    disable_hw = codec_choice == "3"
 
     if video_codec == "hevc_videotoolbox":
         # Validate immediately so user knows before proceeding.
@@ -969,7 +1051,9 @@ def run_wizard_quick_file(args: argparse.Namespace) -> argparse.Namespace | None
         video_preset = {"1": "fast", "2": "faster", "3": "veryfast", "4": "medium", "5": "slow"}[preset_choice]
 
         # Encoder must be selected here so wizard summary is honest.
-        encoder = select_video_encoder(disable_hw=getattr(args, "disable_hw_video", False))
+        encoder = select_video_encoder(
+            disable_hw=disable_hw or getattr(args, "disable_hw_video", False)
+        )
 
     output_path = quick_file_output_path(source, video_crf, video_preset)
     print("\nИтоговые настройки:")
@@ -988,6 +1072,8 @@ def run_wizard_quick_file(args: argparse.Namespace) -> argparse.Namespace | None
     args.video_preset = video_preset
     args.video_codec = video_codec
     args.video_qp = video_qp
+    if disable_hw:
+        args.disable_hw_video = True
     return args
 
 
@@ -2044,7 +2130,7 @@ def run_find_similar_videos_mode(
         path for path in collect_files(input_dir)
         if path.suffix.lower() in VIDEO_EXTENSIONS and not path.is_symlink()
     ]
-    print(f"Режим: поиск визуально похожих видео")
+    print("Режим: поиск визуально похожих видео")
     print(f"Видеофайлов для анализа: {len(candidates)}")
     print(f"Sample-кадров на файл: {n_samples}, hash-threshold: {threshold}")
 
@@ -2058,7 +2144,7 @@ def run_find_similar_videos_mode(
             meta = _video_metadata(source)
             if meta is None:
                 reason = "ffprobe/ffmpeg не смог прочитать метаданные"
-                print(f"ПРОПУСК (метаданные)")
+                print("ПРОПУСК (метаданные)")
                 skipped_rows.append({"file_path": str(source), "reason": reason})
                 continue
             sigs = _video_signature(source, n_samples, tmp_dir)
@@ -2928,6 +3014,32 @@ def movie_mkv_copy_output_path(source: Path) -> Path:
     return candidate
 
 
+def movie_mkv_folder_suffix(video_mode: str, crf: int) -> str:
+    """
+    Suffix appended to a dragged folder's name to build the output folder name.
+
+    Single source of truth: movie_mkv_folder_output_path() generates names with
+    it and folder_is_previous_output() recognises them with it, so the two can
+    never drift apart.
+    """
+    return "remux" if video_mode == "copy" else f"x265 crf{crf}"
+
+
+def folder_is_previous_output(directory: Path) -> bool:
+    """
+    True if *directory* looks like an output folder this tool created earlier.
+
+    Folder mode keeps the ORIGINAL file names inside "<Name> remux", so nothing
+    in a file name marks it as ours — the marker lives on the folder. Matching
+    is on the exact suffix, never a substring: a user folder called
+    "Мои remux-эксперименты" must stay fully visible.
+    """
+    name = directory.name
+    if name.endswith(" " + movie_mkv_folder_suffix("copy", 0)):
+        return True
+    return re.search(r" x265 crf\d+$", name) is not None
+
+
 def looks_like_previous_output(path: Path) -> bool:
     """
     True if *path* looks like a file this tool produced earlier.
@@ -2935,13 +3047,17 @@ def looks_like_previous_output(path: Path) -> bool:
     Older runs wrote their result next to the original, so a folder can hold
     both. Re-processing an already processed file is never what the user wants,
     so folder scanning skips these (they can still be selected by hand).
+    Folder-mode results carry no marker in the file name, so the parent
+    directory is checked too.
     """
     stem = path.stem
     if stem.endswith("_remux"):
         return True
     if re.search(r"_remux_\d+$", stem):
         return True
-    return "_movie_x265_crf" in stem or "_compressed_crf" in stem
+    if "_movie_x265_crf" in stem or "_compressed_crf" in stem:
+        return True
+    return folder_is_previous_output(path.parent)
 
 
 def movie_mkv_folder_output_path(
@@ -2958,12 +3074,20 @@ def movie_mkv_folder_output_path(
     file somehow already exists. Does NOT create anything on disk (that is left
     to reserve_destination).
     """
-    suffix = "remux" if video_mode == "copy" else f"x265 crf{crf}"
+    suffix = movie_mkv_folder_suffix(video_mode, crf)
     out_dir = source_dir.parent / f"{source_dir.name} {suffix}"
-    candidate = out_dir / f"{source.stem}.mkv"
+    # Files pulled in from sub-folders keep their relative sub-path, so
+    # "Season 1/Ep01.mkv" and "Season 2/Ep01.mkv" land in different folders
+    # instead of fighting over one name.
+    try:
+        relative_parent = source.parent.relative_to(source_dir)
+    except ValueError:
+        relative_parent = Path(".")
+    target_dir = out_dir / relative_parent
+    candidate = target_dir / f"{source.stem}.mkv"
     counter = 2
     while candidate.exists():
-        candidate = out_dir / f"{source.stem}_{counter}.mkv"
+        candidate = target_dir / f"{source.stem}_{counter}.mkv"
         counter += 1
     return candidate
 
@@ -3115,7 +3239,10 @@ def _probe_movie_streams(
     print(f"\nАнализирую потоки: {source.name} …")
     streams = probe_streams(source)
     if not streams:
-        print("Ошибка: не удалось получить информацию о потоках.", file=sys.stderr)
+        print(
+            f"Ошибка ({source.name}): не удалось получить информацию о потоках.",
+            file=sys.stderr,
+        )
         return None
 
     video_streams   = [s for s in streams if s["codec_type"] == "video"]
@@ -3123,10 +3250,10 @@ def _probe_movie_streams(
     subtitle_streams = [s for s in streams if s["codec_type"] == "subtitle"]
 
     if not video_streams:
-        print("Ошибка: видеопотоков не найдено.", file=sys.stderr)
+        print(f"Ошибка ({source.name}): видеопотоков не найдено.", file=sys.stderr)
         return None
     if not audio_streams:
-        print("Ошибка: аудиопотоков не найдено.", file=sys.stderr)
+        print(f"Ошибка ({source.name}): аудиопотоков не найдено.", file=sys.stderr)
         return None
 
     return streams, video_streams, audio_streams, subtitle_streams
@@ -3275,7 +3402,43 @@ def run_wizard_movie_mkv(
     Sets args.movie_mkv to a LIST of per-file job dicts so main() can dispatch
     to the right execution path.
     """
-    print("\nРежим: сжать фильм(ы) в MKV с выбором дорожек")
+    print("\nРежим: пересобрать фильмы/сериалы в MKV с выбором дорожек")
+
+    def _is_video(path: Path) -> bool:
+        return (
+            path.is_file()
+            and not path.is_symlink()
+            and path.suffix.lower() in VIDEO_EXTENSIONS
+        )
+
+    def _videos_directly_in(directory: Path) -> list[Path]:
+        return sorted(path for path in directory.iterdir() if _is_video(path))
+
+    def _videos_in_subfolders(directory: Path) -> list[Path]:
+        """Videos below *directory* but NOT at its top level (one full walk)."""
+        found: list[Path] = []
+        for root, dir_names, file_names in os.walk(directory, followlinks=False):
+            root_path = Path(root)
+            if root_path == directory:
+                continue
+            dir_names.sort()
+            for name in sorted(file_names):
+                path = root_path / name
+                if _is_video(path) and not looks_like_previous_output(path):
+                    found.append(path)
+        return found
+
+    def _report_skipped(skipped: list[Path]) -> None:
+        """Never skip silently — a stranger's Movie_remux.mkv looks the same."""
+        if not skipped:
+            return
+        print(f"  Пропущено файлов — {len(skipped)} (похоже на результат прошлого запуска):")
+        for path in skipped:
+            print(f"    - {path.name}")
+        print(
+            "  Если это ваши файлы, перетащите их по отдельности — "
+            "они будут добавлены."
+        )
 
     # --- step 1: choose source file(s) ---
     sources: list[Path] = []
@@ -3304,22 +3467,37 @@ def run_wizard_movie_mkv(
         for candidate in clean_terminal_paths(line):
             resolved = candidate.resolve()
             if resolved.is_dir():
-                found = sorted(
-                    path for path in resolved.iterdir()
-                    if path.is_file()
-                    and not path.is_symlink()
-                    and path.suffix.lower() in VIDEO_EXTENSIONS
-                )
+                found = _videos_directly_in(resolved)
                 videos = [path for path in found if not looks_like_previous_output(path)]
-                skipped = len(found) - len(videos)
+                skipped = [path for path in found if looks_like_previous_output(path)]
                 if not videos:
                     print(f"В папке нет видеофайлов: {resolved}")
-                    continue
-                print(f"Папка «{resolved.name}»: найдено видеофайлов — {len(videos)}")
-                if skipped:
+                    _report_skipped(skipped)
+                    # Nothing at the top level — the season may be split into
+                    # per-season sub-folders, so offer to look one level deeper.
+                    nested = _videos_in_subfolders(resolved)
+                    if not nested:
+                        continue
+                    sub_dirs = sorted({path.parent for path in nested})
                     print(
-                        f"  (пропущено {skipped} — похоже на результат прошлого запуска)"
+                        f"Зато видео есть во вложенных папках ({len(nested)} шт. "
+                        f"в {len(sub_dirs)}):"
                     )
+                    for sub in sub_dirs:
+                        print(f"  - {sub.relative_to(resolved)}")
+                    if not prompt_yes_no(
+                        "Искать видео и во вложенных папках? yes/no [no]: ", "no"
+                    ):
+                        print(
+                            "Вложенные папки пропущены. Перетащите нужную "
+                            "подпапку отдельно, если хотите обработать именно её."
+                        )
+                        continue
+                    videos = nested
+                    print(f"Папка «{resolved.name}»: добавлено из вложенных папок — {len(videos)}")
+                else:
+                    print(f"Папка «{resolved.name}»: найдено видеофайлов — {len(videos)}")
+                    _report_skipped(skipped)
                 for video in videos:
                     if _add_one(video):
                         # Remember the dragged folder so the result can be written
@@ -3334,9 +3512,11 @@ def run_wizard_movie_mkv(
         return added
 
     print(
-        "\nСовет: для целого сезона перетащите ПАПКУ — будут добавлены все видео "
-        "внутри неё. Терминал принимает не больше 1024 символов в строке, "
-        "поэтому перетащить разом много файлов с длинными путями не получится."
+        "\nСовет: для целого сезона перетащите ПАПКУ — будут добавлены видео, "
+        "лежащие непосредственно в ней. Если там их нет, а есть во вложенных "
+        "папках, скрипт спросит, искать ли в них. Терминал принимает не больше "
+        "1024 символов в строке, поэтому перетащить разом много файлов "
+        "с длинными путями не получится."
     )
     while True:
         file_value = input(
@@ -3363,11 +3543,24 @@ def run_wizard_movie_mkv(
 
     # --- step 2: probe every file first, then choose streams ---
     probed: list[tuple[Path, tuple[list, list, list, list]]] = []
+    skipped_sources: list[Path] = []
     for source in sources:
         result = _probe_movie_streams(source)
         if result is None:
-            return None
+            # A silent movie (no audio track) or an unreadable file must not
+            # throw away the answers already given for the other files.
+            print(f"Файл пропущен: {source.name}")
+            skipped_sources.append(source)
+            continue
         probed.append((source, result))
+
+    if not probed:
+        print("Ни один файл не удалось проанализировать. Запуск отменён.")
+        return None
+    if skipped_sources:
+        print(f"\nПропущено файлов: {len(skipped_sources)}")
+        for skipped in skipped_sources:
+            print(f"  - {skipped.name}")
 
     # For episodes of one series the video/audio tracks are usually identical
     # while subtitle tracks may vary slightly. So compare video+audio and
@@ -3435,15 +3628,17 @@ def run_wizard_movie_mkv(
 
     # --- step 6: video quality preset (asked ONCE for all files) ---
     print("\nСжатие видео для фильма:")
-    print("  1. БЕЗ СЖАТИЯ — copy, оставить видео как есть (быстро, без потерь)")
+    print("  1. БЕЗ СЖАТИЯ — copy, оставить видео как есть (быстро, без потерь) [по умолчанию]")
     print("  2. Очень высокое качество: CRF 20")
-    print("  3. Баланс: CRF 22 (по умолчанию)")
+    print("  3. Баланс: CRF 22")
     print("  4. Компактнее: CRF 24")
     print("  5. Ввести вручную")
-    q_choice = prompt_menu("Выберите 1-5 [Enter = 3]: ", set("12345"), "3")
+    q_choice = prompt_menu("Выберите 1-5 [Enter = 1]: ", set("12345"), "1")
     if q_choice == "1":
         video_mode = "copy"
         crf = 0
+        # Unused when video_mode == "copy" (no -preset is passed to ffmpeg),
+        # but it still travels into the job dict, so keep it a harmless string.
         preset = "copy"
     else:
         video_mode = "encode"
@@ -3491,14 +3686,21 @@ def run_wizard_movie_mkv(
                    "opus": "libopus 128k"}[audio_mode]
 
     print("\nИтоговые настройки:")
-    print(f"  Контейнер  : MKV")
+    print("  Контейнер   : MKV")
     if video_mode == "copy":
-        print(f"  Видео       : copy (без сжатия, без потерь)")
+        print("  Видео       : copy (без сжатия, без потерь)")
     else:
-        print(f"  Кодек видео: libx265")
-        print(f"  CRF        : {crf}")
-        print(f"  Preset     : {preset}")
+        print("  Кодек видео : libx265")
+        print(f"  CRF         : {crf}")
+        print(f"  Preset      : {preset}")
     print(f"  Аудио       : {audio_label}")
+    if video_mode == "copy":
+        print("  Время       : ремукс без перекодирования: обычно меньше минуты.")
+    else:
+        print(
+            "  Время       : перекодирование libx265 идёт долго: "
+            "ориентировочно несколько часов на фильм."
+        )
     # When everything lands in one new folder, state it once instead of making
     # the user read the same directory on every line below.
     out_dirs = {sel["output_path"].parent for sel in per_file}
@@ -3671,25 +3873,38 @@ def main() -> int:
             print("Ошибка: ffmpeg не найден. Установите: brew install ffmpeg",
                   file=sys.stderr)
             return 2
-        # Support both a single job dict (backward compat) and a list of jobs.
-        jobs = args.movie_mkv if isinstance(args.movie_mkv, list) else [args.movie_mkv]
+        jobs = args.movie_mkv
         total = len(jobs)
         failures = 0
         for job_idx, m in enumerate(jobs, start=1):
             source: Path = m["source"]
             output_path: Path = m["output_path"]
-            if not reserve_destination(output_path):
-                # highly unlikely (the output-path helpers already avoid existing
-                # files), but be safe — derive fresh candidates from the base name.
-                base_stem = output_path.stem
-                counter = 2
-                while True:
-                    candidate = output_path.with_name(f"{base_stem}_{counter}.mkv")
-                    if reserve_destination(candidate):
-                        output_path = candidate
-                        break
-                    counter += 1
-            original_size = source.stat().st_size
+            # Reserving and sizing can both fail (source deleted mid-run, output
+            # folder not writable). Neither may kill the whole batch, and a
+            # reservation we already made must not be left behind as a 0-byte file.
+            reserved = False
+            try:
+                if not reserve_destination(output_path):
+                    # highly unlikely (the output-path helpers already avoid existing
+                    # files), but be safe — derive fresh candidates from the base name.
+                    base_stem = output_path.stem
+                    counter = 2
+                    while True:
+                        candidate = output_path.with_name(f"{base_stem}_{counter}.mkv")
+                        if reserve_destination(candidate):
+                            output_path = candidate
+                            break
+                        counter += 1
+                # Set only AFTER a successful reservation: a failure before this
+                # point must never unlink a path we do not own.
+                reserved = True
+                original_size = source.stat().st_size
+            except OSError as exc:
+                if reserved:
+                    output_path.unlink(missing_ok=True)
+                print(f"Ошибка ({source.name}): {exc}", file=sys.stderr)
+                failures += 1
+                continue
             if total > 1:
                 print(f"\n[{job_idx}/{total}] Обрабатываю: {source.name} …")
             else:
@@ -3801,6 +4016,10 @@ def main() -> int:
     summary_rows: list[dict[str, object]] = []
     total_videos = sum(classify(path) == "video" for path in files)
     current_video = 0
+    # Destinations claimed by THIS run. Needed because destination_for() rewrites
+    # every video suffix to .mp4, so Ep01.mkv and Ep01.mp4 collide on Ep01.mp4.
+    # Kept in sync between the dry-run plan and the real run.
+    occupied: set[Path] = set()
 
     print(f"Режим: {'DRY-RUN (без изменений)' if args.dry_run else 'обработка'}")
     print(f"Input:  {input_dir}")
@@ -3828,9 +4047,29 @@ def main() -> int:
             print(f"ОШИБКА: {message}")
             continue
 
+        collision_note = ""
         if args.dry_run:
-            status = "would-skip-existing" if destination.exists() else "planned"
-            note = "Файл уже существует; не будет перезаписан" if destination.exists() else ""
+            # Mirror the real run exactly: same collision handling, same names.
+            if destination in occupied:
+                renamed = unique_path_for_existing_target(destination, occupied)
+                collision_note = (
+                    f"Имя изменено: {destination.name} уже занято другим "
+                    "исходным файлом этого запуска"
+                )
+                print(
+                    f"[renamed] {destination.relative_to(output_dir)} -> "
+                    f"{renamed.relative_to(output_dir)}"
+                )
+                destination = renamed
+            already_there = destination.exists()
+            status = "would-skip-existing" if already_there else "planned"
+            note = "Файл уже существует; не будет перезаписан" if already_there else ""
+            if collision_note:
+                note = f"{note}; {collision_note}" if note else collision_note
+            if not already_there:
+                # A pre-existing file is skipped, not claimed — same as the real
+                # run, where a failed reservation never enters `occupied`.
+                occupied.add(destination)
             print(f"[{action}] {source.relative_to(input_dir)} -> {destination.relative_to(output_dir)}")
             summary_rows.append(make_summary_row(
                 source, destination, input_dir, output_dir, category, action,
@@ -3838,12 +4077,44 @@ def main() -> int:
             ))
             continue
 
-        if not reserve_destination(destination):
-            note = "Файл уже существует; пропущен без перезаписи"
-            print(f"[skip-existing] {destination.relative_to(output_dir)}")
+        try:
+            if not reserve_destination(destination):
+                if destination in occupied:
+                    # Two different sources map to the same destination in THIS
+                    # run (e.g. Ep01.mkv and Ep01.mp4 both become Ep01.mp4).
+                    # Give the second one a free name instead of dropping it.
+                    renamed = unique_path_for_existing_target(destination, occupied)
+                    if not reserve_destination(renamed):
+                        raise OSError(f"не удалось зарезервировать имя {renamed.name}")
+                    print(
+                        f"[renamed] {destination.relative_to(output_dir)} -> "
+                        f"{renamed.relative_to(output_dir)}"
+                    )
+                    collision_note = (
+                        f"Имя изменено: {destination.name} уже занято другим "
+                        "исходным файлом этого запуска"
+                    )
+                    destination = renamed
+                    occupied.add(destination)
+                else:
+                    # The file was already in output BEFORE this run — not ours,
+                    # so it is left strictly alone.
+                    note = "Файл уже существует; пропущен без перезаписи"
+                    print(f"[skip-existing] {destination.relative_to(output_dir)}")
+                    summary_rows.append(make_summary_row(
+                        source, destination, input_dir, output_dir, category, action,
+                        "skipped", original_size, destination.stat().st_size, note,
+                    ))
+                    continue
+            else:
+                occupied.add(destination)
+        except OSError as exc:
+            message = f"{source}: {exc}"
+            errors.append(message)
+            print(f"ОШИБКА: {message}")
             summary_rows.append(make_summary_row(
                 source, destination, input_dir, output_dir, category, action,
-                "skipped", original_size, destination.stat().st_size, note,
+                "error", original_size, "", str(exc),
             ))
             continue
 
@@ -3877,6 +4148,8 @@ def main() -> int:
                 )
             else:
                 print(f"[готово] {source.relative_to(input_dir)} ({note})")
+            if collision_note:
+                note = f"{note}; {collision_note}" if note else collision_note
             summary_rows.append(make_summary_row(
                 source, destination, input_dir, output_dir, category, action,
                 "completed", original_size, output_size, note,
@@ -3887,9 +4160,10 @@ def main() -> int:
             message = f"{source}: {exc}"
             errors.append(message)
             print(f"ОШИБКА: {message}")
+            error_note = f"{exc}; {collision_note}" if collision_note else str(exc)
             summary_rows.append(make_summary_row(
                 source, destination, input_dir, output_dir, category, action,
-                "error", original_size, "", str(exc),
+                "error", original_size, "", error_note,
             ))
 
     counters.errors = len(errors)
