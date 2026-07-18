@@ -8,6 +8,7 @@ import csv
 import hashlib
 import html
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -2927,6 +2928,46 @@ def movie_mkv_copy_output_path(source: Path) -> Path:
     return candidate
 
 
+def looks_like_previous_output(path: Path) -> bool:
+    """
+    True if *path* looks like a file this tool produced earlier.
+
+    Older runs wrote their result next to the original, so a folder can hold
+    both. Re-processing an already processed file is never what the user wants,
+    so folder scanning skips these (they can still be selected by hand).
+    """
+    stem = path.stem
+    if stem.endswith("_remux"):
+        return True
+    if re.search(r"_remux_\d+$", stem):
+        return True
+    return "_movie_x265_crf" in stem or "_compressed_crf" in stem
+
+
+def movie_mkv_folder_output_path(
+    source: Path, source_dir: Path, video_mode: str, crf: int,
+) -> Path:
+    """
+    Output path for a file that came from a dragged FOLDER.
+
+    The result goes into a NEW folder placed next to the dragged one, so the
+    originals stay untouched and unmixed:
+        .../Nip Tuck.S01          <- dragged, untouched
+        .../Nip Tuck.S01 remux    <- created here
+    Inside it each file keeps its original name. Adds _2, _3 … only if such a
+    file somehow already exists. Does NOT create anything on disk (that is left
+    to reserve_destination).
+    """
+    suffix = "remux" if video_mode == "copy" else f"x265 crf{crf}"
+    out_dir = source_dir.parent / f"{source_dir.name} {suffix}"
+    candidate = out_dir / f"{source.stem}.mkv"
+    counter = 2
+    while candidate.exists():
+        candidate = out_dir / f"{source.stem}_{counter}.mkv"
+        counter += 1
+    return candidate
+
+
 def compress_movie_with_stream_selection(
     source: Path,
     destination: Path,
@@ -3238,6 +3279,8 @@ def run_wizard_movie_mkv(
 
     # --- step 1: choose source file(s) ---
     sources: list[Path] = []
+    # Maps a source file to the folder it was dragged in as part of, if any.
+    source_folder: dict[Path, Path] = {}
 
     def _add_one(resolved: Path) -> int:
         """Append one validated file if it is not already selected."""
@@ -3261,18 +3304,28 @@ def run_wizard_movie_mkv(
         for candidate in clean_terminal_paths(line):
             resolved = candidate.resolve()
             if resolved.is_dir():
-                videos = sorted(
+                found = sorted(
                     path for path in resolved.iterdir()
                     if path.is_file()
                     and not path.is_symlink()
                     and path.suffix.lower() in VIDEO_EXTENSIONS
                 )
+                videos = [path for path in found if not looks_like_previous_output(path)]
+                skipped = len(found) - len(videos)
                 if not videos:
                     print(f"В папке нет видеофайлов: {resolved}")
                     continue
                 print(f"Папка «{resolved.name}»: найдено видеофайлов — {len(videos)}")
+                if skipped:
+                    print(
+                        f"  (пропущено {skipped} — похоже на результат прошлого запуска)"
+                    )
                 for video in videos:
-                    added += _add_one(video)
+                    if _add_one(video):
+                        # Remember the dragged folder so the result can be written
+                        # to a new folder NEXT TO it instead of among the originals.
+                        source_folder[video] = resolved
+                        added += 1
                 continue
             if not (resolved.is_file() and not resolved.is_symlink()):
                 print(f"Файл не найден или это не обычный файл: {resolved}")
@@ -3418,9 +3471,16 @@ def run_wizard_movie_mkv(
     audio_mode = {"1": "copy", "2": "aac", "3": "opus"}[a_choice]
 
     # --- step 9: output path (per file) ---
+    # Files dragged in as a folder go to a new folder next to it; individually
+    # dragged files keep landing next to the original, as before.
     for sel in per_file:
         src = sel["source"]
-        if video_mode == "copy":
+        src_dir = source_folder.get(src)
+        if src_dir is not None:
+            sel["output_path"] = movie_mkv_folder_output_path(
+                src, src_dir, video_mode, crf
+            )
+        elif video_mode == "copy":
             sel["output_path"] = movie_mkv_copy_output_path(src)
         else:
             sel["output_path"] = movie_mkv_output_path(src, crf, preset)
@@ -3439,7 +3499,12 @@ def run_wizard_movie_mkv(
         print(f"  CRF        : {crf}")
         print(f"  Preset     : {preset}")
     print(f"  Аудио       : {audio_label}")
-    print("  Оригинал не будет изменён.")
+    # When everything lands in one new folder, state it once instead of making
+    # the user read the same directory on every line below.
+    out_dirs = {sel["output_path"].parent for sel in per_file}
+    if len(out_dirs) == 1 and len(per_file) > 1:
+        print(f"  Папка результата: {out_dirs.pop()}")
+    print("  Оригиналы не будут изменены.")
 
     for idx, sel in enumerate(per_file, start=1):
         subtitle_stream_indices = sel["subtitle_stream_indices"]
