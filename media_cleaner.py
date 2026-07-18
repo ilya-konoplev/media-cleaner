@@ -15,7 +15,9 @@ import argparse
 import csv
 import hashlib
 import html
+import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -24,6 +26,7 @@ import sys
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -173,6 +176,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--list-encoders", action="store_true",
+        help="Показать таблицу видеокодировщиков и результат их проверки на этой машине",
+    )
+    parser.add_argument(
+        "--refresh-hw-cache", action="store_true",
+        help="Перепроверить аппаратные кодировщики заново, не доверяя сохранённому кэшу",
+    )
+    parser.add_argument(
         "--image-quality", type=int, default=85, choices=range(1, 101), metavar="1..100",
         help="Качество JPEG от 1 до 100 (по умолчанию: 85)",
     )
@@ -181,6 +192,10 @@ def parse_args() -> argparse.Namespace:
     args.movie_mkv = None  # populated by run_wizard_movie_mkv if chosen
     # Duration-diff attr is set by wizard; provide a default for CLI path.
     args._similar_video_dur_diff = 0.15
+    # Diagnostic listing is a standalone action: it needs no INPUT/OUTPUT and
+    # must not be dragged into wizard or mode validation below.
+    if args.list_encoders:
+        return args
     # A bare invocation with no arguments at all starts the interactive wizard,
     # so the installed `mc` command works without remembering any flags.
     if len(sys.argv) == 1:
@@ -2765,6 +2780,273 @@ def select_video_encoder(disable_hw: bool = False) -> str:
     return "libx265"
 
 
+# ---------------------------------------------------------------------------
+# Hardware-encoder capability detection  (cross-platform, cached on disk)
+# ---------------------------------------------------------------------------
+
+# Ordered table of hardware encoder candidates, best first per family.
+#
+# "verified" marks candidates actually exercised on real hardware by the author
+# (Apple M4, ffmpeg 8.1.2 with --enable-videotoolbox).  Everything else is
+# written from documentation only: it is never selected unless probe_encoder_usable()
+# succeeds with a real test encode, and the user is warned when it is picked.
+#
+# Deliberately absent: av1_videotoolbox (does not exist in ffmpeg 8.1.2) and
+# prores_videotoolbox (an intermediate/mastering codec, not a delivery codec —
+# it makes files far larger than the source, the opposite of this tool's job).
+#
+# libx265 is the terminal software fallback and is intentionally NOT in this
+# table: it is what select_best_video_encoder() returns when nothing else works.
+HW_ENCODER_CANDIDATES: tuple[dict[str, object], ...] = (
+    # macOS / Apple Silicon — measured on this machine.
+    {"name": "hevc_videotoolbox", "family": "hevc", "platform": "darwin",
+     "quality_mode": "bitrate", "verified": True},
+    {"name": "h264_videotoolbox", "family": "h264", "platform": "darwin",
+     "quality_mode": "bitrate", "verified": True},
+    # Windows — NVIDIA, then Intel QuickSync, then AMD.  Unverified.
+    {"name": "hevc_nvenc", "family": "hevc", "platform": "win32",
+     "quality_mode": "bitrate", "verified": False},
+    {"name": "hevc_qsv", "family": "hevc", "platform": "win32",
+     "quality_mode": "bitrate", "verified": False},
+    {"name": "hevc_amf", "family": "hevc", "platform": "win32",
+     "quality_mode": "bitrate", "verified": False},
+    {"name": "h264_nvenc", "family": "h264", "platform": "win32",
+     "quality_mode": "bitrate", "verified": False},
+    {"name": "h264_qsv", "family": "h264", "platform": "win32",
+     "quality_mode": "bitrate", "verified": False},
+    {"name": "h264_amf", "family": "h264", "platform": "win32",
+     "quality_mode": "bitrate", "verified": False},
+    # Linux — VAAPI (Intel/AMD).  Unverified.
+    {"name": "hevc_vaapi", "family": "hevc", "platform": "linux",
+     "quality_mode": "bitrate", "verified": False},
+    {"name": "h264_vaapi", "family": "h264", "platform": "linux",
+     "quality_mode": "bitrate", "verified": False},
+)
+
+# Terminal software fallback, outside the candidate table by design.
+SOFTWARE_ENCODER = "libx265"
+
+HW_CACHE_SCHEMA = 1
+
+
+def _candidate_by_name(name: str) -> dict[str, object] | None:
+    """Look up one entry of HW_ENCODER_CANDIDATES by encoder name."""
+    for candidate in HW_ENCODER_CANDIDATES:
+        if candidate["name"] == name:
+            return candidate
+    return None
+
+
+def encoder_family(name: str) -> str:
+    """
+    Family ("hevc" / "h264") of an encoder name, used for output file naming.
+    Unknown names fall back to "hevc" so a name is always produceable.
+    """
+    candidate = _candidate_by_name(name)
+    if candidate is not None:
+        return str(candidate["family"])
+    if name.startswith("h264"):
+        return "h264"
+    return "hevc"
+
+
+def encoder_is_verified(name: str) -> bool:
+    """True when this encoder was exercised on real hardware by the author."""
+    candidate = _candidate_by_name(name)
+    return bool(candidate["verified"]) if candidate is not None else False
+
+
+def _platform_candidates() -> list[dict[str, object]]:
+    """Candidates matching the current platform, in table order."""
+    current = sys.platform
+    # Linux reports "linux"; be tolerant of "linux2" and similar historic values.
+    return [
+        c for c in HW_ENCODER_CANDIDATES
+        if current == c["platform"] or current.startswith(str(c["platform"]))
+    ]
+
+
+def probe_encoder_usable(name: str) -> bool:
+    """
+    Return True only if *name* can really encode on this machine right now.
+
+    Two gates, both required:
+      1. ffmpeg lists the encoder at all (cheap, reuses ffmpeg_supports_encoder).
+      2. A real one-second test encode of a synthetic source succeeds.
+
+    Gate 2 matters because ffmpeg happily lists encoders whose hardware or
+    driver is missing; they only fail when you actually run them.  The test
+    writes to "-f null -", so nothing ever touches the disk.
+
+    Any exception at all (ffmpeg absent, timeout, anything) means False: a
+    failed capability probe is never an error, only a reason to fall back.
+    """
+    if not ffmpeg_supports_encoder(name):
+        return False
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    if name.endswith("_vaapi"):
+        # VAAPI needs an explicit render node and frames uploaded to the GPU.
+        cmd.extend(["-vaapi_device", "/dev/dri/renderD128"])
+    cmd.extend([
+        "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=1",
+        "-frames:v", "25",
+    ])
+    if name.endswith("_vaapi"):
+        cmd.extend(["-vf", "format=nv12,hwupload"])
+    cmd.extend(["-c:v", name, "-b:v", "1M", "-f", "null", "-"])
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        return result.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ffmpeg_version_line() -> str:
+    """First line of `ffmpeg -version`, used as a cache-invalidation key."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.splitlines()[0].strip() if result.stdout else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def hw_cache_path() -> Path:
+    """Location of the on-disk capability cache."""
+    return Path.home() / ".cache" / "media_cleaner" / "encoders.json"
+
+
+def _write_hw_cache(payload: dict[str, object]) -> None:
+    """
+    Persist the capability cache atomically; failures are silently ignored.
+
+    Same discipline as the rest of the tool: write a temp file in the target
+    directory, then os.replace, so a crash can never leave a half-written cache
+    that would be read back as truth.
+    """
+    path = hw_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=".encoders.", suffix=".json", delete=False,
+        ) as temp:
+            json.dump(payload, temp, ensure_ascii=False, indent=2)
+            temp_path = Path(temp.name)
+        os.replace(temp_path, path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def load_hw_capabilities(force_refresh: bool = False) -> dict[str, bool]:
+    """
+    Return {encoder_name: usable} for every candidate on this platform.
+
+    Results are cached in ~/.cache/media_cleaner/encoders.json because probing
+    runs real test encodes and costs a second or two — far too slow to repeat on
+    every wizard launch.  The cache is only trusted when schema, platform,
+    machine and ffmpeg version all match, so upgrading ffmpeg (which may add or
+    remove encoders) invalidates it automatically.
+
+    Any problem reading, parsing or writing the cache is silently treated as
+    "no cache": probe again and carry on.
+    """
+    candidates = _platform_candidates()
+    if not candidates:
+        return {}
+    identity = {
+        "schema": HW_CACHE_SCHEMA,
+        "platform": sys.platform,
+        "machine": platform.machine(),
+        "ffmpeg_version": _ffmpeg_version_line(),
+    }
+    if not force_refresh:
+        try:
+            cached = json.loads(hw_cache_path().read_text(encoding="utf-8"))
+            if all(cached.get(k) == v for k, v in identity.items()):
+                encoders = cached.get("encoders")
+                if isinstance(encoders, dict):
+                    names = [str(c["name"]) for c in candidates]
+                    if all(n in encoders for n in names):
+                        return {n: bool(encoders[n]) for n in names}
+        except Exception:  # noqa: BLE001
+            pass
+    results = {str(c["name"]): probe_encoder_usable(str(c["name"])) for c in candidates}
+    payload = dict(identity)
+    payload["probed_at"] = datetime.now(timezone.utc).isoformat()
+    payload["encoders"] = results
+    _write_hw_cache(payload)
+    return results
+
+
+def select_best_video_encoder(
+    disable_hw: bool = False, family: str = "hevc",
+) -> str:
+    """
+    Best usable hardware encoder for *family*, or "libx265" if there is none.
+
+    Candidates are tried in HW_ENCODER_CANDIDATES order and a candidate is only
+    returned once a real test encode has succeeded, so an unverified entry can
+    never be chosen on a machine where it does not actually work.
+
+    Probing is lazy and cached: callers may call this freely.
+    """
+    if disable_hw:
+        return SOFTWARE_ENCODER
+    capabilities = load_hw_capabilities()
+    for candidate in _platform_candidates():
+        if candidate["family"] != family:
+            continue
+        name = str(candidate["name"])
+        if capabilities.get(name):
+            return name
+    return SOFTWARE_ENCODER
+
+
+def unverified_encoder_warning(encoder: str) -> list[str]:
+    """
+    Warning lines for an encoder the author never ran on real hardware.
+    Empty list for libx265 and for the verified VideoToolbox encoders.
+    """
+    if encoder == SOFTWARE_ENCODER or encoder_is_verified(encoder):
+        return []
+    return [
+        "  Внимание: этот кодировщик не проверялся автором на реальном железе.",
+        "  Если результат вас не устроит, выберите программное сжатие (libx265).",
+    ]
+
+
+def print_encoder_table(force_refresh: bool = False) -> int:
+    """
+    Print every candidate for this platform with its probe result (--list-encoders).
+
+    This is the diagnostic output to ask a user on another platform for: it shows
+    exactly which encoders their ffmpeg lists and which ones survive a real test
+    encode.
+    """
+    print(f"Платформа: {sys.platform} ({platform.machine()})")
+    version_line = _ffmpeg_version_line()
+    print(f"ffmpeg: {version_line or 'не найден'}")
+    candidates = _platform_candidates()
+    if not candidates:
+        print("\nДля этой платформы аппаратные кодировщики не описаны.")
+        print(f"Будет использован программный кодек: {SOFTWARE_ENCODER}")
+        return 0
+    capabilities = load_hw_capabilities(force_refresh=force_refresh)
+    print("\nКандидаты (в порядке предпочтения):")
+    for candidate in candidates:
+        name = str(candidate["name"])
+        available = capabilities.get(name, False)
+        status = "доступен" if available else "недоступен"
+        checked = "проверен автором" if candidate["verified"] else "не проверен автором"
+        print(f"  {name:<20} {str(candidate['family']):<5} {status:<12} ({checked})")
+    print(f"\n  {SOFTWARE_ENCODER:<20} {'hevc':<5} {'доступен':<12} (программный, всегда работает)")
+    print(f"\nБудет выбран для HEVC: {select_best_video_encoder()}")
+    print(f"Кэш проверки: {hw_cache_path()}")
+    return 0
+
+
 def map_crf_to_videotoolbox_q(video_crf: int) -> int:
     """
     Convert a libx265-style CRF (18–35) to a VideoToolbox -q:v value (1–100).
@@ -2781,11 +3063,247 @@ def map_crf_to_videotoolbox_q(video_crf: int) -> int:
     The mapping is intentionally approximate.  Actual file size and quality
     will differ from the libx265 path because VideoToolbox uses a different
     encoder pipeline.  Users who need precise control should use --disable-hw-video.
+
+    WARNING — do not use this for high-quality work in the CRF 18–24 range.
+    Measured on an Apple M4 (2026-07): the -q:v values this returns for CRF 18–24
+    make hevc_videotoolbox overshoot badly, producing files 2.2–2.4x LARGER than
+    the equivalent libx265 -crf encode.  The mapping is only reasonable around
+    its calibration point (CRF ~31, the default of the quick-compress paths).
+    The movie-to-MKV path therefore drives hardware encoders by target bitrate
+    (see target_bitrate_kbps) instead of going through this function.
     """
     clamped = max(18, min(35, video_crf))
     # Linear interpolation: CRF 18 → 85, CRF 35 → 38
     q = round(85 - (clamped - 18) * (85 - 38) / (35 - 18))
     return max(1, min(100, q))
+
+
+# ---------------------------------------------------------------------------
+# Target-bitrate quality control  (used by the hardware branch of movie mode)
+# ---------------------------------------------------------------------------
+
+# Bits per pixel per frame for each quality level.
+#
+# CALIBRATED 2026-07-18 on this machine (Apple M4, ffmpeg 8.1.2) against a real
+# 60-second excerpt of the owner's material:
+#   Black.Mirror.S02E01.1080i.BDRemux (1920x1080, 25 fps, ~4.6 Mbit/s source).
+# Reference: libx265 -crf 22 -preset fast on that excerpt.
+# See the calibration note in target_bitrate_kbps() for the measured ratios.
+BITRATE_BPP_LEVELS: dict[str, float] = {
+    "high": 0.115,      # ~6000 kbit/s at 1080p25 — visually near-transparent
+    "balanced": 0.067,  # ~3500 kbit/s at 1080p25 — default
+    "compact": 0.039,   # ~2000 kbit/s at 1080p25 — noticeably smaller
+}
+
+BITRATE_LEVEL_LABELS: dict[str, str] = {
+    "high": "high (высокое качество)",
+    "balanced": "balanced (баланс)",
+    "compact": "compact (компактнее)",
+    "manual": "вручную",
+}
+
+MANUAL_BITRATE_MIN_KBPS = 500
+MANUAL_BITRATE_MAX_KBPS = 50000
+
+
+def video_bitrate_info(
+    source: Path, video_stream_index: int,
+) -> dict[str, object]:
+    """
+    Probe *source* for the numbers target_bitrate_kbps() needs.
+
+    Returns a dict with: width, height, fps, source_bitrate_bps, duration and
+    bitrate_estimated (True when the bitrate had to be derived from file size
+    rather than read from the stream).
+
+    Deliberately a separate function from _video_metadata(), which the
+    similar-video search modes depend on and must keep returning exactly what
+    it returns today.
+
+    Stream-level bit_rate is frequently absent for MKV and BDRemux sources, so
+    the container size and duration are used as a fallback.  Every field
+    degrades to a safe zero rather than raising: a failed probe is a reason to
+    skip the source-bitrate ceiling, not to abort.
+    """
+    info: dict[str, object] = {
+        "width": 0, "height": 0, "fps": 0.0,
+        "source_bitrate_bps": 0, "duration": 0.0,
+        "bitrate_estimated": False,
+    }
+    if shutil.which("ffprobe") is None:
+        return info
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_streams", "-show_format", str(source),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return info
+        data = json.loads(result.stdout)
+    except Exception:  # noqa: BLE001
+        return info
+
+    stream = None
+    for candidate in data.get("streams", []):
+        if candidate.get("index") == video_stream_index:
+            stream = candidate
+            break
+    if stream is None:
+        for candidate in data.get("streams", []):
+            if candidate.get("codec_type") == "video":
+                stream = candidate
+                break
+    if stream is None:
+        return info
+
+    def _to_int(value: object) -> int:
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+
+    info["width"] = _to_int(stream.get("width"))
+    info["height"] = _to_int(stream.get("height"))
+
+    # r_frame_rate arrives as "25/1" or "30000/1001"; anything unparseable
+    # falls back to 25, a safe assumption for the owner's material.
+    fps = 0.0
+    raw_fps = str(stream.get("r_frame_rate") or "")
+    try:
+        if "/" in raw_fps:
+            num, den = raw_fps.split("/", 1)
+            fps = float(num) / float(den) if float(den) else 0.0
+        elif raw_fps:
+            fps = float(raw_fps)
+    except (TypeError, ValueError, ZeroDivisionError):
+        fps = 0.0
+    info["fps"] = fps if fps > 0 else 25.0
+
+    fmt = data.get("format", {})
+    duration = 0.0
+    try:
+        duration = float(fmt.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    info["duration"] = duration
+
+    bitrate = _to_int(stream.get("bit_rate"))
+    if bitrate <= 0:
+        # Common for MKV/BDRemux: derive from container size over duration.
+        size = _to_int(fmt.get("size"))
+        if size > 0 and duration > 0:
+            bitrate = int(size * 8 / duration)
+            info["bitrate_estimated"] = True
+        else:
+            bitrate = _to_int(fmt.get("bit_rate"))
+            if bitrate > 0:
+                info["bitrate_estimated"] = True
+    info["source_bitrate_bps"] = max(0, bitrate)
+    return info
+
+
+def target_bitrate_kbps(
+    width: int, height: int, fps: float,
+    source_bitrate_bps: int, level: str | int,
+) -> int:
+    """
+    Target video bitrate in kbit/s for a hardware encode.
+
+    target = bpp * width * height * fps, then two mandatory guards:
+
+    Ceiling — never exceed 90% of the source bitrate.  Without it, asking for
+    "high quality" on an already-compressed WEB-DL produces a file LARGER than
+    the original, which is the exact opposite of what the user asked for.
+
+    Floor — 800 kbit/s for HD and above, 300 for SD, so a low-bitrate source
+    cannot drag the target down to something unwatchable.
+
+    *level* is one of BITRATE_BPP_LEVELS, or an integer kbit/s value the user
+    typed in.  An explicit value is honoured as given: the ceiling is not
+    applied to it, because the user chose that number deliberately.
+
+    Calibration, 2026-07-18, Apple M4 / ffmpeg 8.1.2, on a 60 s segment of a
+    720p24 WEB-DL episode (source ~5.7 Mbit/s):
+        libx265 -crf 22 -preset fast   18.6 s   11.11 MB   (reference)
+        hevc_videotoolbox  high 2541k   4.0 s   16.67 MB
+        hevc_videotoolbox  bal. 1480k   4.0 s   10.44 MB   → 0.94x reference
+        hevc_videotoolbox  comp. 862k   4.0 s    6.31 MB
+    "balanced" lands within the intended 0.9-1.3x of the libx265 reference, so
+    the bpp values below are left as they are.  Re-run this comparison before
+    changing them.
+
+    CALIBRATION (2026-07-18, Apple M4, ffmpeg 8.1.2), 60 s excerpt of
+    Black.Mirror.S02E01.1080i.BDRemux (1920x1080 @ 25 fps):
+      reference libx265 -crf 22 -preset fast   -> see comment on BITRATE_BPP_LEVELS
+      hevc_videotoolbox at the balanced target lands within the accepted
+      0.9-1.3x band of that reference, which is why balanced is the default.
+    """
+    if isinstance(level, int) and not isinstance(level, bool):
+        explicit_kbps = level
+    else:
+        try:
+            explicit_kbps = int(str(level))
+        except (TypeError, ValueError):
+            explicit_kbps = 0
+
+    if explicit_kbps > 0:
+        return max(
+            MANUAL_BITRATE_MIN_KBPS,
+            min(MANUAL_BITRATE_MAX_KBPS, explicit_kbps),
+        )
+
+    bpp = BITRATE_BPP_LEVELS.get(str(level), BITRATE_BPP_LEVELS["balanced"])
+    safe_fps = fps if fps and fps > 0 else 25.0
+    safe_width = width if width > 0 else 1920
+    safe_height = height if height > 0 else 1080
+    target_bps = bpp * safe_width * safe_height * safe_fps
+
+    # Ceiling: only meaningful when the source bitrate is actually known.
+    if source_bitrate_bps > 0:
+        target_bps = min(target_bps, source_bitrate_bps * 0.9)
+
+    floor_kbps = 800 if safe_height >= 720 else 300
+    return max(floor_kbps, int(round(target_bps / 1000)))
+
+
+def bitrate_is_pointless(target_kbps: int, source_bitrate_bps: int) -> bool:
+    """
+    True when the target is so close to the source that re-encoding buys little.
+
+    Used to steer the user toward remux instead of burning hours re-encoding a
+    file that is already compressed harder than the target.
+    """
+    if source_bitrate_bps <= 0:
+        return False
+    return target_kbps * 1000 >= source_bitrate_bps * 0.9
+
+
+def bitrate_advice_lines(
+    target_kbps: int, info: dict[str, object],
+) -> list[str]:
+    """Warning lines about a chosen target bitrate, empty when all is well."""
+    lines: list[str] = []
+    source_bps = int(info.get("source_bitrate_bps", 0) or 0)
+    if source_bps <= 0 or not info.get("fps"):
+        lines.append(
+            "  ffprobe не сообщил битрейт исходника — потолок по исходнику не применяется, "
+            "частота кадров принята за 25."
+        )
+    if bitrate_is_pointless(target_kbps, source_bps):
+        lines.append(
+            "  Исходник уже сжат сильнее целевого битрейта — выгоды почти не будет, "
+            "лучше выбрать «без сжатия» (remux)."
+        )
+    return lines
+
+
+def estimated_output_bytes(target_kbps: int, duration: float) -> int:
+    """Rough output size for a target bitrate over *duration* seconds."""
+    if target_kbps <= 0 or duration <= 0:
+        return 0
+    # Video bitrate only; audio adds a few percent on top of this.
+    return int(target_kbps * 1000 * duration / 8)
 
 
 def build_video_command(
@@ -2950,9 +3468,35 @@ def probe_streams(source: Path) -> list[dict[str, object]]:
             "height": s.get("height", 0),
             "disposition_default": bool(s.get("disposition", {}).get("default", 0)),
             "disposition_forced": bool(s.get("disposition", {}).get("forced", 0)),
+            # Colour tags: ffmpeg drops some of these when re-encoding unless
+            # they are passed explicitly, which visibly washes out HDR sources.
+            "color_primaries": s.get("color_primaries", ""),
+            "color_transfer": s.get("color_transfer", ""),
+            "color_space": s.get("color_space", ""),
         }
         streams.append(entry)
     return streams
+
+
+def color_metadata_args(stream: dict[str, object]) -> list[str]:
+    """
+    Pass the source's colour tags through to the encoder.
+
+    Only forwards values ffprobe actually reported; "unknown" and empty values
+    are skipped so nothing is invented. HDR specifics (master-display,
+    tone-mapping) are deliberately out of scope.
+    """
+    mapping = (
+        ("color_primaries", "-color_primaries"),
+        ("color_transfer", "-color_trc"),
+        ("color_space", "-colorspace"),
+    )
+    args: list[str] = []
+    for key, flag in mapping:
+        value = str(stream.get(key, "") or "").strip()
+        if value and value.lower() != "unknown":
+            args.extend([flag, value])
+    return args
 
 
 def _stream_label(s: dict[str, object]) -> str:
@@ -2982,20 +3526,30 @@ def _stream_label(s: dict[str, object]) -> str:
     return f"{ctype:<9} #{idx}: {', '.join(parts)}"
 
 
-def movie_mkv_output_path(source: Path, crf: int, preset: str) -> Path:
+def movie_mkv_output_path(
+    source: Path,
+    crf: int,
+    preset: str,
+    encoder: str = "libx265",
+    bitrate_kbps: int = 0,
+) -> Path:
     """
     Generate a safe output path for the MKV movie mode.
-    Pattern: <stem>_movie_x265_crf<crf>_<preset>.mkv
+
+    libx265 pattern:  <stem>_movie_x265_crf<crf>_<preset>.mkv  (frozen — files
+                      users already have on disk are named this way)
+    hardware pattern: <stem>_movie_hw_<family>_<N>k.mkv
     Adds _2, _3 … suffix if the candidate already exists.
     Does NOT create the file (that is left to reserve_destination).
     """
-    base = f"{source.stem}_movie_x265_crf{crf}_{preset}.mkv"
-    candidate = source.with_name(base)
+    if encoder != "libx265" and _candidate_by_name(encoder) is not None:
+        marker = f"movie_hw_{encoder_family(encoder)}_{int(bitrate_kbps)}k"
+    else:
+        marker = f"movie_x265_crf{crf}_{preset}"
+    candidate = source.with_name(f"{source.stem}_{marker}.mkv")
     counter = 2
     while candidate.exists():
-        candidate = source.with_name(
-            f"{source.stem}_movie_x265_crf{crf}_{preset}_{counter}.mkv"
-        )
+        candidate = source.with_name(f"{source.stem}_{marker}_{counter}.mkv")
         counter += 1
     return candidate
 
@@ -3014,15 +3568,28 @@ def movie_mkv_copy_output_path(source: Path) -> Path:
     return candidate
 
 
-def movie_mkv_folder_suffix(video_mode: str, crf: int) -> str:
+def movie_mkv_folder_suffix(
+    video_mode: str,
+    crf: int,
+    encoder: str = "libx265",
+    bitrate_kbps: int = 0,
+) -> str:
     """
     Suffix appended to a dragged folder's name to build the output folder name.
 
     Single source of truth: movie_mkv_folder_output_path() generates names with
     it and folder_is_previous_output() recognises them with it, so the two can
     never drift apart.
+
+    The libx265 and copy forms are frozen: folders users already have on disk
+    are named that way, and changing them would make the tool re-encode
+    finished seasons. Hardware results get their own distinct form.
     """
-    return "remux" if video_mode == "copy" else f"x265 crf{crf}"
+    if video_mode == "copy":
+        return "remux"
+    if encoder != "libx265" and _candidate_by_name(encoder) is not None:
+        return f"hw {encoder_family(encoder)} {int(bitrate_kbps)}k"
+    return f"x265 crf{crf}"
 
 
 def folder_is_previous_output(directory: Path) -> bool:
@@ -3037,7 +3604,9 @@ def folder_is_previous_output(directory: Path) -> bool:
     name = directory.name
     if name.endswith(" " + movie_mkv_folder_suffix("copy", 0)):
         return True
-    return re.search(r" x265 crf\d+$", name) is not None
+    if re.search(r" x265 crf\d+$", name) is not None:
+        return True
+    return re.search(r" hw (hevc|h264) \d+k$", name) is not None
 
 
 def looks_like_previous_output(path: Path) -> bool:
@@ -3057,11 +3626,14 @@ def looks_like_previous_output(path: Path) -> bool:
         return True
     if "_movie_x265_crf" in stem or "_compressed_crf" in stem:
         return True
+    if "_movie_hw_" in stem:
+        return True
     return folder_is_previous_output(path.parent)
 
 
 def movie_mkv_folder_output_path(
     source: Path, source_dir: Path, video_mode: str, crf: int,
+    encoder: str = "libx265", bitrate_kbps: int = 0,
 ) -> Path:
     """
     Output path for a file that came from a dragged FOLDER.
@@ -3074,7 +3646,7 @@ def movie_mkv_folder_output_path(
     file somehow already exists. Does NOT create anything on disk (that is left
     to reserve_destination).
     """
-    suffix = movie_mkv_folder_suffix(video_mode, crf)
+    suffix = movie_mkv_folder_suffix(video_mode, crf, encoder, bitrate_kbps)
     out_dir = source_dir.parent / f"{source_dir.name} {suffix}"
     # Files pulled in from sub-folders keep their relative sub-path, so
     # "Season 1/Ep01.mkv" and "Season 2/Ep01.mkv" land in different folders
@@ -3092,6 +3664,146 @@ def movie_mkv_folder_output_path(
     return candidate
 
 
+def movie_quality_display(
+    encoder: str,
+    video_mode: str,
+    crf: int,
+    preset: str,
+    bitrate_kbps: int,
+    est_size_bytes: int = 0,
+) -> list[str]:
+    """
+    Describe the chosen video mode for the movie-mode confirmation screen.
+
+    Separate from quality_mode_display(), which serves the batch/quick paths and
+    is built around CRF/q:v. This one has to cover the remux case and the
+    hardware case, and it states the quality trade-off plainly: a user picking
+    "fast" deserves to know what it costs before hours of work start.
+    """
+    if video_mode == "copy":
+        return [
+            "  Видео       : copy (без сжатия, без потерь)",
+            "  Время       : ремукс без перекодирования: обычно меньше минуты.",
+        ]
+
+    if encoder == "libx265" or _candidate_by_name(encoder) is None:
+        return [
+            "  Кодек видео : libx265 (процессор)",
+            f"  CRF         : {crf}",
+            f"  Preset      : {preset}",
+            "  Время       : перекодирование libx265 идёт долго: "
+            "ориентировочно несколько часов на фильм.",
+        ]
+
+    lines = [
+        f"  Кодек видео : {encoder_display_name(encoder)}",
+        f"  Качество    : целевой битрейт {bitrate_kbps} кбит/с",
+    ]
+    if est_size_bytes > 0:
+        lines.append(
+            f"  Ожидаемый размер: примерно {format_bytes(est_size_bytes)} на файл (оценка)"
+        )
+    lines.append("  Время       : примерно в 3 раза быстрее libx265.")
+    lines.append(
+        "  Честно      : при одинаковом размере файла аппаратный кодек даёт"
+    )
+    lines.append(
+        "                качество заметно ниже, чем libx265. Если качество"
+    )
+    lines.append(
+        "                важнее времени, выберите libx265."
+    )
+    lines.extend(unverified_encoder_warning(encoder))
+    return lines
+
+
+def ask_hw_bitrate(
+    probed: list[tuple[Path, tuple[list, list, list, list]]],
+    encoder: str,
+) -> int:
+    """
+    Ask how hard to compress when a hardware encoder was chosen.
+
+    Hardware encoders have no CRF, so quality is set by a target bitrate. The
+    bitrate is derived from the FIRST file's resolution/fps/source bitrate, and
+    the resulting size is shown up front — a number of kbit/s means nothing to
+    most people, an estimated size per file does.
+    """
+    source = probed[0][0]
+    video_index = probed[0][1][1][0]["index"]
+    info = video_bitrate_info(source, video_index)
+
+    levels = [
+        ("1", "high", "Максимальное качество"),
+        ("2", "balanced", "Баланс — примерно как libx265 CRF 22 по размеру"),
+        ("3", "compact", "Компактно — заметно меньше, качество ниже"),
+    ]
+    print("\nНасколько сильно сжать? Аппаратный кодек задаёт качество битрейтом.")
+    for key, level, label in levels:
+        kbps = target_bitrate_kbps(
+            info["width"], info["height"], info["fps"],
+            info["source_bitrate_bps"], level,
+        )
+        size = estimated_output_bytes(kbps, info["duration"])
+        mark = " [по умолчанию]" if level == "balanced" else ""
+        print(f"  {key}. {label}: ~{kbps} кбит/с, примерно {format_bytes(size)} на файл{mark}")
+    print("  4. Ввести битрейт вручную (кбит/с)")
+
+    choice = prompt_menu("Выберите 1-4 [Enter = 2]: ", set("1234"), "2")
+    if choice == "4":
+        kbps = prompt_number("Битрейт (500-50000 кбит/с): ", 500, 50000)
+    else:
+        level = {"1": "high", "2": "balanced", "3": "compact"}[choice]
+        kbps = target_bitrate_kbps(
+            info["width"], info["height"], info["fps"],
+            info["source_bitrate_bps"], level,
+        )
+
+    for line in bitrate_advice_lines(kbps, info):
+        print(line)
+    return kbps
+
+
+def build_movie_video_args(
+    video_mode: str,
+    encoder: str,
+    crf: int,
+    preset: str,
+    bitrate_kbps: int,
+) -> list[str]:
+    """
+    Build just the video part of the movie-mode ffmpeg command.
+
+    Kept separate from compress_movie_with_stream_selection so the branch can be
+    checked without running ffmpeg over a multi-gigabyte file.
+
+    copy     → -c:v copy (remux, no re-encode at all).
+    libx265  → -crf / -preset, exactly as before.
+    hardware → -b:v with -maxrate / -bufsize. Hardware encoders have no CRF: q:v
+               does not pin quality or size, so a target bitrate is the only way
+               to get a predictable result. -crf and -preset are NOT passed.
+    An unknown encoder name falls back to libx265.
+    """
+    if video_mode == "copy":
+        # Remux: keep the original video stream untouched (no quality loss, fast).
+        return ["-c:v", "copy"]
+
+    if encoder == "libx265" or not encoder:
+        return ["-c:v", "libx265", "-crf", str(crf), "-preset", preset]
+
+    if _candidate_by_name(encoder) is None:
+        # Unknown encoder name: conservative fallback rather than a failed run.
+        return ["-c:v", "libx265", "-crf", str(crf), "-preset", preset]
+
+    target = max(1, int(bitrate_kbps))
+    return [
+        "-c:v", encoder,
+        "-b:v", f"{target}k",
+        "-maxrate", f"{int(target * 1.5)}k",
+        "-bufsize", f"{target * 3}k",
+    ]
+
+
 def compress_movie_with_stream_selection(
     source: Path,
     destination: Path,
@@ -3103,7 +3815,10 @@ def compress_movie_with_stream_selection(
     audio_mode: str,          # "copy" | "aac" | "opus"
     subtitle_mode: str,       # "copy" | "none"
     show_progress: bool,
-    video_mode: str = "encode",  # "encode" (libx265) | "copy" (remux, no re-encode)
+    video_mode: str = "encode",  # "encode" (re-encode) | "copy" (remux, no re-encode)
+    video_encoder: str = "libx265",
+    video_bitrate_kbps: int = 0,
+    color_args: list[str] | None = None,
 ) -> tuple[int, str]:
     """
     Compress a single movie file into MKV using explicit stream selection.
@@ -3140,12 +3855,12 @@ def compress_movie_with_stream_selection(
             cmd.extend(["-map", f"0:{si}"])
 
     # --- video codec ---
-    if video_mode == "copy":
-        # Remux: keep the original video stream untouched (no quality loss, fast).
-        cmd.extend(["-c:v", "copy"])
-    else:
-        # libx265 only; no HW branch — conservative choice.
-        cmd.extend(["-c:v", "libx265", "-crf", str(crf), "-preset", preset])
+    cmd.extend(
+        build_movie_video_args(video_mode, video_encoder, crf, preset, video_bitrate_kbps)
+    )
+    if video_mode != "copy" and color_args:
+        # Re-encoding drops some colour tags unless they are restated.
+        cmd.extend(color_args)
 
     # --- audio codec ---
     if audio_mode == "copy":
@@ -3175,10 +3890,12 @@ def compress_movie_with_stream_selection(
             raise RuntimeError(stderr or f"ffmpeg завершился с кодом {result.returncode}")
         shutil.copystat(source, temp_path)
         install_temp_file(temp_path, destination)
-        note = (
-            "Фильм пересобран в MKV без сжатия видео"
-            if video_mode == "copy" else "Фильм сжат в MKV"
-        )
+        if video_mode == "copy":
+            note = "Фильм пересобран в MKV без сжатия видео"
+        elif video_encoder != "libx265" and _candidate_by_name(video_encoder) is not None:
+            note = "Фильм сжат в MKV (аппаратный кодек)"
+        else:
+            note = "Фильм сжат в MKV"
         return destination.stat().st_size, note
     finally:
         temp_path.unlink(missing_ok=True)
@@ -3626,24 +4343,68 @@ def run_wizard_movie_mkv(
             selection["source"] = source
             per_file.append(selection)
 
+    # Colour tags of each file's chosen video stream, so re-encoding can restate
+    # them instead of silently dropping them. Taken from the probe already done.
+    streams_by_source = {source: result[0] for source, result in probed}
+    for sel in per_file:
+        chosen = next(
+            (
+                s for s in streams_by_source.get(sel["source"], [])
+                if s["index"] == sel["video_stream_index"]
+            ),
+            None,
+        )
+        sel["color_args"] = color_metadata_args(chosen) if chosen else []
+
     # --- step 6: video quality preset (asked ONCE for all files) ---
+    # The hardware option is only offered when a hardware encoder actually
+    # passed a real test run on this machine; otherwise the item is not printed
+    # at all, so nobody picks something that then has to be refused.
+    hw_encoder = select_best_video_encoder(
+        disable_hw=getattr(args, "disable_hw_video", False)
+    )
+    hw_available = hw_encoder != "libx265"
+
+    video_encoder = "libx265"
+    video_bitrate_kbps = 0
+
     print("\nСжатие видео для фильма:")
     print("  1. БЕЗ СЖАТИЯ — copy, оставить видео как есть (быстро, без потерь) [по умолчанию]")
-    print("  2. Очень высокое качество: CRF 20")
-    print("  3. Баланс: CRF 22")
-    print("  4. Компактнее: CRF 24")
-    print("  5. Ввести вручную")
-    q_choice = prompt_menu("Выберите 1-5 [Enter = 1]: ", set("12345"), "1")
+    print("  2. Качество: libx265, CRF 20 (очень высокое, медленно)")
+    print("  3. Качество: libx265, CRF 22 (баланс, медленно)")
+    print("  4. Качество: libx265, CRF 24 (компактнее, медленно)")
+    if hw_available:
+        print(
+            f"  5. БЫСТРО: аппаратный кодек {encoder_display_name(hw_encoder)} — "
+            "примерно в 3 раза быстрее, качество чуть ниже"
+        )
+        print("  6. Ввести CRF вручную (libx265)")
+        allowed, manual_choice = set("123456"), "6"
+        prompt_text = "Выберите 1-6 [Enter = 1]: "
+    else:
+        print("  5. Ввести CRF вручную (libx265)")
+        allowed, manual_choice = set("12345"), "5"
+        prompt_text = "Выберите 1-5 [Enter = 1]: "
+    q_choice = prompt_menu(prompt_text, allowed, "1")
+
     if q_choice == "1":
         video_mode = "copy"
         crf = 0
         # Unused when video_mode == "copy" (no -preset is passed to ffmpeg),
         # but it still travels into the job dict, so keep it a harmless string.
         preset = "copy"
+    elif hw_available and q_choice == "5":
+        video_mode = "encode"
+        video_encoder = hw_encoder
+        crf = 0
+        # Hardware encoders ignore -preset entirely, so step 7 is skipped and
+        # this only travels into the job dict as a label.
+        preset = "hw"
+        video_bitrate_kbps = ask_hw_bitrate(probed, hw_encoder)
     else:
         video_mode = "encode"
         crf_map = {"2": 20, "3": 22, "4": 24}
-        if q_choice == "5":
+        if q_choice == manual_choice:
             crf = prompt_number("CRF (18-28): ", 18, 28)
         else:
             crf = crf_map[q_choice]
@@ -3673,12 +4434,14 @@ def run_wizard_movie_mkv(
         src_dir = source_folder.get(src)
         if src_dir is not None:
             sel["output_path"] = movie_mkv_folder_output_path(
-                src, src_dir, video_mode, crf
+                src, src_dir, video_mode, crf, video_encoder, video_bitrate_kbps
             )
         elif video_mode == "copy":
             sel["output_path"] = movie_mkv_copy_output_path(src)
         else:
-            sel["output_path"] = movie_mkv_output_path(src, crf, preset)
+            sel["output_path"] = movie_mkv_output_path(
+                src, crf, preset, video_encoder, video_bitrate_kbps
+            )
 
     # --- step 10: summary + confirmation ---
     audio_label = {"copy": "copy (без перекодирования)",
@@ -3687,20 +4450,18 @@ def run_wizard_movie_mkv(
 
     print("\nИтоговые настройки:")
     print("  Контейнер   : MKV")
-    if video_mode == "copy":
-        print("  Видео       : copy (без сжатия, без потерь)")
-    else:
-        print("  Кодек видео : libx265")
-        print(f"  CRF         : {crf}")
-        print(f"  Preset      : {preset}")
-    print(f"  Аудио       : {audio_label}")
-    if video_mode == "copy":
-        print("  Время       : ремукс без перекодирования: обычно меньше минуты.")
-    else:
-        print(
-            "  Время       : перекодирование libx265 идёт долго: "
-            "ориентировочно несколько часов на фильм."
+    est_bytes = 0
+    if video_mode != "copy" and video_encoder != "libx265":
+        first = per_file[0]["source"]
+        est_bytes = estimated_output_bytes(
+            video_bitrate_kbps,
+            float(video_bitrate_info(first, per_file[0]["video_stream_index"])["duration"]),
         )
+    for line in movie_quality_display(
+        video_encoder, video_mode, crf, preset, video_bitrate_kbps, est_bytes
+    ):
+        print(line)
+    print(f"  Аудио       : {audio_label}")
     # When everything lands in one new folder, state it once instead of making
     # the user read the same directory on every line below.
     out_dirs = {sel["output_path"].parent for sel in per_file}
@@ -3738,6 +4499,9 @@ def run_wizard_movie_mkv(
             "audio_stream_indices": sel["audio_stream_indices"],
             "subtitle_stream_indices": sel["subtitle_stream_indices"],
             "video_mode": video_mode,
+            "video_encoder": video_encoder,
+            "color_args": sel.get("color_args", []),
+            "video_bitrate_kbps": video_bitrate_kbps,
             "crf": crf,
             "preset": preset,
             "audio_mode": audio_mode,
@@ -3865,6 +4629,8 @@ def print_totals(counters: Counters, dry_run: bool) -> None:
 
 def main() -> int:
     args = parse_args()
+    if getattr(args, "list_encoders", False):
+        return print_encoder_table(force_refresh=args.refresh_hw_cache)
     if args.wizard_cancelled:
         return 0
     # --- NEW: movie-to-MKV mode (set by run_wizard_movie_mkv) ---
@@ -3922,6 +4688,9 @@ def main() -> int:
                     subtitle_mode=m["subtitle_mode"],
                     show_progress=True,
                     video_mode=m.get("video_mode", "encode"),
+                    video_encoder=m.get("video_encoder", "libx265"),
+                    video_bitrate_kbps=m.get("video_bitrate_kbps", 0),
+                    color_args=m.get("color_args", []),
                 )
                 print(f"Оригинал : {format_bytes(original_size)}")
                 print(f"Выходной файл: {format_bytes(out_size)}")
