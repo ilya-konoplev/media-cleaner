@@ -112,6 +112,13 @@ def parse_args() -> argparse.Namespace:
         help="Найти визуально похожие фото для ручной проверки",
     )
     parser.add_argument(
+        "--pick", action="store_true",
+        help=(
+            "Вместе с --review-similar-photos: выбирать фото прямо на странице. "
+            "Запускает локального помощника, который сохраняет выбор в отчёт"
+        ),
+    )
+    parser.add_argument(
         "--review-similar-photos", action="store_true",
         help=(
             "Построить HTML-обзор похожих фото по готовому "
@@ -247,6 +254,8 @@ def parse_args() -> argparse.Namespace:
     ]
     if args.best_shot and not args.find_similar_photos:
         parser.error("--best-shot работает только вместе с --find-similar-photos")
+    if args.pick and not args.review_similar_photos:
+        parser.error("--pick работает только вместе с --review-similar-photos")
     if args.quick_file and (args.wizard or any(special_modes)):
         parser.error("--quick-file нельзя сочетать с другими режимами")
     if sum(bool(mode) for mode in special_modes) > 1:
@@ -2935,7 +2944,118 @@ def _similar_review_group_rank(rows: list[dict[str, str]]) -> tuple[int, float]:
     return (-len(rows), mean_distance)
 
 
-def run_review_similar_photos_mode(input_dir: Path, output_dir: Path) -> int:
+def apply_picks_to_report(report_path: Path, picks: dict[str, str]) -> tuple[int, int]:
+    """
+    Rewrite suggested_action in the similar-photos report from browser picks.
+
+    *picks* maps a group id to the file the user chose to keep. Within each
+    listed group the chosen row becomes keep_candidate and every other row
+    becomes review_duplicate; groups the user did not touch are left alone.
+
+    Only this one column is touched, so --trash-similar-from-report keeps
+    working on the result. Written via a temp file + os.replace, so an
+    interrupted save can never leave a half-written report behind.
+    """
+    with report_path.open("r", newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    groups_changed = 0
+    rows_changed = 0
+    for group_id, chosen in picks.items():
+        group_rows = [
+            row for row in rows
+            if (row.get("similar_group_id") or "").strip() == str(group_id).strip()
+        ]
+        if not group_rows:
+            continue
+        chosen_norm = str(chosen).strip()
+        if not any((row.get("file_path") or "").strip() == chosen_norm for row in group_rows):
+            continue  # picked file is not part of this group — ignore silently
+        touched = False
+        for row in group_rows:
+            is_chosen = (row.get("file_path") or "").strip() == chosen_norm
+            wanted = "keep_candidate" if is_chosen else "review_duplicate"
+            if (row.get("suggested_action") or "").strip() != wanted:
+                row["suggested_action"] = wanted
+                rows_changed += 1
+                touched = True
+        if touched:
+            groups_changed += 1
+
+    with tempfile.NamedTemporaryFile(
+        "w", newline="", encoding="utf-8-sig", delete=False,
+        dir=report_path.parent, prefix=f".{report_path.stem}.", suffix=".csv",
+    ) as temp:
+        temp_path = Path(temp.name)
+        writer = csv.DictWriter(temp, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temp_path, report_path)
+    return groups_changed, rows_changed
+
+
+def serve_similar_review(output_dir: Path, report_path: Path, page_name: str) -> None:
+    """
+    Serve the review page from localhost so picks can be saved back.
+
+    A plain file:// page cannot write to disk, so choosing in the browser needs
+    a helper. It binds to 127.0.0.1 on a free port, serves only *output_dir*,
+    and answers exactly one POST route. Runs until Ctrl-C.
+    """
+    import http.server
+    import json as _json
+    import webbrowser
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=str(output_dir), **kw)
+
+        def log_message(self, *args):  # noqa: D102 - keep the terminal readable
+            pass
+
+        def do_POST(self):  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+            if self.path != "/save":
+                self.send_error(404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                picks = _json.loads(self.rfile.read(length) or b"{}")
+                groups, rows = apply_picks_to_report(report_path, picks)
+                message = (
+                    f"Сохранено. Групп изменено: {groups}, строк: {rows}."
+                    if rows else "Сохранено. Изменений не было."
+                )
+                print(f"  {message}")
+            except Exception as exc:  # noqa: BLE001 - report, never crash the server
+                message = f"Ошибка сохранения: {exc}"
+                print(f"  {message}", file=sys.stderr)
+            payload = _json.dumps({"message": message}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as httpd:
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/{page_name}"
+        print(f"\nОткрой в браузере: {url}")
+        print("Отметь, какое фото оставить в каждой группе, и нажми «Сохранить выбор».")
+        print("Когда закончишь — заверши помощника клавишами Ctrl-C.")
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 - opening a browser is a convenience
+            pass
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nПомощник остановлен. Отчёт сохранён.")
+
+
+def run_review_similar_photos_mode(
+    input_dir: Path, output_dir: Path, pick: bool = False,
+) -> int:
     """
     Build a visual HTML review from an existing similar_photos_report.csv.
 
@@ -3035,8 +3155,19 @@ def run_review_similar_photos_mode(input_dir: Path, output_dir: Path) -> int:
                 '<p class="warn">Файл не найден на диске</p>' if not source.is_file()
                 else '<p class="warn">Миниатюру построить не удалось</p>'
             )
+            picker = ""
+            if pick:
+                # One radio group per photo group: choosing a photo here is the
+                # whole point of the mode, so it sits above the thumbnail.
+                checked = " checked" if is_keeper else ""
+                picker = (
+                    f'<label class="pick"><input type="radio" '
+                    f'name="grp::{html.escape(group_id)}" '
+                    f'value="{html.escape(str(source))}"{checked}> оставить этот</label>'
+                )
             item_html.append(
                 f'<div class="item {"keep" if is_keeper else "review"}" title="{html.escape(str(source))}">'
+                f'{picker}'
                 f'{badge}'
                 f'{thumbnail_html(thumbnail, output_dir, source.name)}'
                 f'{note}'
@@ -3055,8 +3186,10 @@ def run_review_similar_photos_mode(input_dir: Path, output_dir: Path) -> int:
         )
 
     body = SIMILAR_REVIEW_STYLE + (
+        (SIMILAR_PICK_STYLE + SIMILAR_PICK_PANEL) if pick else ""
+    ) + (
         "".join(html_groups) or "<p>В отчёте нет групп похожих фото.</p>"
-    )
+    ) + (SIMILAR_PICK_SCRIPT if pick else "")
     try:
         html_path.write_text(
             html_document("Похожие фото: визуальный обзор", body), encoding="utf-8",
@@ -3072,6 +3205,10 @@ def run_review_similar_photos_mode(input_dir: Path, output_dir: Path) -> int:
     if missing_files:
         print(f"Файлов не найдено на диске: {missing_files}")
     print("Оригиналы не менялись и не удалялись.")
+    if pick:
+        # The page is useless as a plain file here: saving needs the helper.
+        serve_similar_review(output_dir, report_path, html_path.name)
+        return 0
     print(f"Открой {html_path} для сравнения фото.")
     open_output_folder(output_dir)
     return 0
@@ -3084,6 +3221,56 @@ def _file_uri_or_text(source: Path) -> str:
     except (ValueError, OSError):
         return str(source)
 
+
+SIMILAR_PICK_STYLE = """<style>
+.pick { display:block; margin:0 0 8px; padding:6px 8px; border-radius:6px;
+        background:#eef2f7; font-weight:600; cursor:pointer; }
+.item.chosen { outline:3px solid #2f7d32; }
+.pickbar { position:sticky; top:0; z-index:5; background:#fff; padding:12px 0;
+           border-bottom:1px solid #ddd; margin-bottom:16px; }
+.pickbar button { font-size:16px; padding:8px 16px; cursor:pointer; }
+.pickbar .status { margin-left:12px; }
+</style>"""
+
+SIMILAR_PICK_PANEL = (
+    '<div class="pickbar">'
+    '<button id="save">Сохранить выбор</button>'
+    '<span class="status" id="status">Отметьте, какое фото оставить в каждой группе.</span>'
+    '</div>'
+)
+
+# Posts the chosen file of every group back to the local helper server, which
+# rewrites suggested_action in the report. Opened without that server (plain
+# file:// double-click) the fetch fails and the page says so instead of
+# pretending the choice was saved.
+SIMILAR_PICK_SCRIPT = """<script>
+function mark() {
+  document.querySelectorAll('.item').forEach(function (item) {
+    var radio = item.querySelector('input[type=radio]');
+    item.classList.toggle('chosen', !!(radio && radio.checked));
+  });
+}
+document.addEventListener('change', mark);
+mark();
+document.getElementById('save').addEventListener('click', function () {
+  var picks = {};
+  document.querySelectorAll('input[type=radio]:checked').forEach(function (radio) {
+    picks[radio.name.replace(/^grp::/, '')] = radio.value;
+  });
+  var status = document.getElementById('status');
+  status.textContent = 'Сохраняю…';
+  fetch('/save', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(picks)
+  }).then(function (r) { return r.json(); }).then(function (data) {
+    status.textContent = data.message;
+  }).catch(function () {
+    status.textContent = 'Не удалось сохранить: страница открыта без помощника. '
+      + 'Запустите режим с флагом --pick и откройте ссылку из терминала.';
+  });
+});
+</script>"""
 
 SIMILAR_REVIEW_STYLE = """<style>
 .items.row { display: flex; flex-wrap: nowrap; overflow-x: auto; gap: 16px;
@@ -5349,7 +5536,7 @@ def main() -> int:
             best_shot=getattr(args, "best_shot", False),
         )
     if getattr(args, "review_similar_photos", False):
-        return run_review_similar_photos_mode(args.input, args.output)
+        return run_review_similar_photos_mode(args.input, args.output, args.pick)
     if args.trash_similar_from_report:
         return run_trash_similar_from_report_mode(
             args.input, args.output, args.dry_run
