@@ -46,6 +46,11 @@ SUMMARY_FIELDS = [
 ]
 REPORT_NAMES = ("summary.csv", "duplicates_report.csv", "errors.log")
 
+# --fast-duplicates pre-filter: how much of a file is read for the partial hash,
+# and the size below which reading the file twice costs more than hashing it once.
+PARTIAL_HASH_CHUNK_BYTES = 1024 * 1024
+PARTIAL_HASH_MIN_FILE_BYTES = 2 * 1024 * 1024
+
 
 @dataclass
 class Counters:
@@ -105,6 +110,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--find-similar-photos", action="store_true",
         help="Найти визуально похожие фото для ручной проверки",
+    )
+    parser.add_argument(
+        "--pick", action="store_true",
+        help=(
+            "Вместе с --review-similar-photos: выбирать фото прямо на странице. "
+            "Запускает локального помощника, который сохраняет выбор в отчёт"
+        ),
+    )
+    parser.add_argument(
+        "--review-similar-photos", action="store_true",
+        help=(
+            "Построить HTML-обзор похожих фото по готовому "
+            "reports/similar_photos_report.csv: группы в один ряд, крупные миниатюры"
+        ),
+    )
+    parser.add_argument(
+        "--best-shot", action="store_true",
+        help=(
+            "Вместе с --find-similar-photos: выбирать keep_candidate по резкости, "
+            "разрешению и размеру, а не по порядку"
+        ),
     )
     parser.add_argument(
         "--trash-similar-from-report", action="store_true",
@@ -184,6 +210,24 @@ def parse_args() -> argparse.Namespace:
         help="Перепроверить аппаратные кодировщики заново, не доверяя сохранённому кэшу",
     )
     parser.add_argument(
+        "--fast-duplicates", action="store_true",
+        help=(
+            "Ускорить поиск точных дубликатов: сначала сравнить первый и последний "
+            "мегабайт файла, полный SHA256 считать только для совпавших"
+        ),
+    )
+    parser.add_argument(
+        "--skip-already-compressed", action="store_true",
+        help=(
+            "Не пережимать то, что уже эффективно сжато (HEVC/AV1 с низким битрейтом, "
+            "экономные JPEG); такие файлы копируются без изменений"
+        ),
+    )
+    parser.add_argument(
+        "--undo-move-duplicates", action="store_true",
+        help="Вернуть файлы из Duplicates_To_Delete на прежние места по reports/moved_duplicates.csv",
+    )
+    parser.add_argument(
         "--image-quality", type=int, default=85, choices=range(1, 101), metavar="1..100",
         help="Качество JPEG от 1 до 100 (по умолчанию: 85)",
     )
@@ -206,12 +250,20 @@ def parse_args() -> argparse.Namespace:
         args.move_duplicates, args.duplicates_only, args.review_duplicates,
         args.find_similar_photos, args.trash_similar_from_report,
         args.find_similar_videos, args.trash_similar_videos_from_report,
+        args.undo_move_duplicates, args.review_similar_photos,
     ]
+    if args.best_shot and not args.find_similar_photos:
+        parser.error("--best-shot работает только вместе с --find-similar-photos")
+    if args.pick and not args.review_similar_photos:
+        parser.error("--pick работает только вместе с --review-similar-photos")
     if args.quick_file and (args.wizard or any(special_modes)):
         parser.error("--quick-file нельзя сочетать с другими режимами")
     if sum(bool(mode) for mode in special_modes) > 1:
         parser.error("выберите только один режим работы с дубликатами или похожими файлами")
-    if args.dry_run and (args.review_duplicates or args.find_similar_photos or args.find_similar_videos):
+    if args.dry_run and (
+        args.review_duplicates or args.find_similar_photos
+        or args.find_similar_videos or args.review_similar_photos
+    ):
         parser.error("--dry-run не нужен для отчётных режимов: они и так не меняют оригиналы")
     if args.wizard and (args.input is not None or args.output is not None):
         parser.error("с --wizard не нужно указывать INPUT и OUTPUT")
@@ -563,7 +615,28 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def find_duplicates(files: list[Path], input_dir: Path) -> tuple[list[dict[str, object]], int, list[str]]:
+def partial_hash_file(path: Path, size: int) -> str:
+    """
+    Cheap pre-filter hash: file size plus the first and last megabyte.
+
+    Two byte-identical files ALWAYS produce the same partial hash, so this can
+    only ever narrow a same-size group down — it never splits real duplicates
+    apart.  A partial-hash match is never trusted on its own: the caller still
+    computes the full SHA256 for every survivor.
+    """
+    digest = hashlib.sha256()
+    digest.update(str(size).encode("ascii"))
+    with path.open("rb") as source:
+        digest.update(source.read(PARTIAL_HASH_CHUNK_BYTES))
+        if size > PARTIAL_HASH_CHUNK_BYTES:
+            source.seek(max(0, size - PARTIAL_HASH_CHUNK_BYTES))
+            digest.update(source.read(PARTIAL_HASH_CHUNK_BYTES))
+    return digest.hexdigest()
+
+
+def find_duplicates(
+    files: list[Path], input_dir: Path, fast: bool = False,
+) -> tuple[list[dict[str, object]], int, list[str]]:
     by_size: dict[int, list[Path]] = defaultdict(list)
     errors: list[str] = []
     for path in files:
@@ -581,7 +654,23 @@ def find_duplicates(files: list[Path], input_dir: Path) -> tuple[list[dict[str, 
         if len(same_size_files) < 2:
             continue
         by_hash: dict[str, list[Path]] = defaultdict(list)
-        for path in same_size_files:
+        if fast and size >= PARTIAL_HASH_MIN_FILE_BYTES:
+            # Pre-filter: read 2 MB per file instead of the whole file, and only
+            # hash in full those that still look alike.  A lone survivor of a
+            # partial-hash bucket cannot have a duplicate, so it is never read
+            # again.  The duplicate verdict below still rests on full SHA256.
+            by_partial: dict[str, list[Path]] = defaultdict(list)
+            for path in same_size_files:
+                try:
+                    by_partial[partial_hash_file(path, size)].append(path)
+                except OSError as exc:
+                    errors.append(f"Не удалось вычислить частичный хеш {path}: {exc}")
+            candidates = [
+                path for group in by_partial.values() if len(group) >= 2 for path in group
+            ]
+        else:
+            candidates = same_size_files
+        for path in candidates:
             try:
                 by_hash[sha256_file(path)].append(path)
             except OSError as exc:
@@ -657,8 +746,9 @@ def write_duplicates_only_reports(
 
 def run_duplicates_only(
     files: list[Path], input_dir: Path, output_dir: Path, dry_run: bool,
+    fast: bool = False,
 ) -> int:
-    raw_rows, duplicate_copies, errors = find_duplicates(files, input_dir)
+    raw_rows, duplicate_copies, errors = find_duplicates(files, input_dir, fast=fast)
     report_rows, duplicate_groups, reclaimable_bytes = duplicate_only_rows(raw_rows)
 
     print("Режим: только поиск точных дубликатов")
@@ -876,7 +966,7 @@ def write_move_duplicates_reports(
 
 
 def run_move_duplicates_mode(
-    input_dir: Path, output_dir: Path, dry_run: bool,
+    input_dir: Path, output_dir: Path, dry_run: bool, fast: bool = False,
 ) -> int:
     input_dir, output_dir = validate_paths(input_dir, output_dir)
     try:
@@ -886,7 +976,7 @@ def run_move_duplicates_mode(
         return 2
 
     files = collect_files(input_dir)
-    duplicate_rows_flat, extra_copies, duplicate_errors = find_duplicates(files, input_dir)
+    duplicate_rows_flat, extra_copies, duplicate_errors = find_duplicates(files, input_dir, fast=fast)
     duplicate_groups = duplicate_groups_from_rows(duplicate_rows_flat, input_dir)
     planned_rows: list[dict[str, object]] = []
     moved_rows: list[dict[str, object]] = []
@@ -977,6 +1067,111 @@ def run_move_duplicates_mode(
         for error in errors:
             print(f"ОШИБКА: {error}", file=sys.stderr)
 
+    return 1 if errors else 0
+
+
+def run_undo_move_duplicates_mode(
+    input_dir: Path, output_dir: Path, dry_run: bool,
+) -> int:
+    """
+    Put files moved by --move-duplicates back where they came from.
+
+    Reads reports/moved_duplicates.csv in OUTPUT, which already records
+    original_path, moved_to and file_size for every moved copy.  Each row is
+    restored only when all three safety checks pass: the moved file is still
+    there, its size still matches what was recorded, and the original path is
+    free.  An occupied original path is ALWAYS a skip, never an overwrite —
+    something else lives there now and it is not ours to replace.
+    """
+    input_dir, output_dir = validate_paths(input_dir, output_dir)
+    report_path = output_dir / "reports" / "moved_duplicates.csv"
+    if not report_path.is_file():
+        print(
+            f"Ошибка: отчёт не найден: {report_path}. "
+            "Откат возможен только после запуска с --move-duplicates.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        with report_path.open(newline="", encoding="utf-8-sig") as handle:
+            rows = list(csv.DictReader(handle))
+    except OSError as exc:
+        print(f"Ошибка чтения отчёта: {exc}", file=sys.stderr)
+        return 2
+
+    print("Режим: откат перемещения дубликатов")
+    print(f"Input:  {input_dir}")
+    print(f"Output: {output_dir}")
+    print(f"Отчёт:  {report_path}")
+    print(f"Записей в отчёте: {len(rows)}")
+    if dry_run:
+        print("DRY-RUN: ничего не перемещается, только план.")
+
+    restored = 0
+    restored_bytes = 0
+    skipped: list[str] = []
+    errors: list[str] = []
+
+    for number, row in enumerate(rows, start=1):
+        original_raw = (row.get("original_path") or "").strip()
+        moved_raw = (row.get("moved_to") or "").strip()
+        if not original_raw or not moved_raw:
+            skipped.append(f"строка {number}: пустые пути в отчёте")
+            continue
+        original_path = Path(original_raw)
+        moved_path = Path(moved_raw)
+        try:
+            expected_size = int(str(row.get("file_size") or "").strip())
+        except ValueError:
+            expected_size = -1
+
+        if not moved_path.is_file():
+            skipped.append(f"{moved_path}: файла нет на месте перемещения")
+            continue
+        try:
+            actual_size = moved_path.stat().st_size
+        except OSError as exc:
+            skipped.append(f"{moved_path}: не удалось прочитать размер ({exc})")
+            continue
+        if expected_size < 0 or actual_size != expected_size:
+            skipped.append(
+                f"{moved_path}: размер изменился ({actual_size} вместо {expected_size}), "
+                "файл трогать небезопасно"
+            )
+            continue
+        if original_path.exists() or original_path.is_symlink():
+            skipped.append(
+                f"{original_path}: место занято другим файлом, ничего не перезаписываю"
+            )
+            continue
+
+        if dry_run:
+            print(f"[вернул бы] {moved_path} -> {original_path}")
+            restored += 1
+            restored_bytes += actual_size
+            continue
+        try:
+            original_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(moved_path), str(original_path))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{moved_path}: {exc}")
+            continue
+        print(f"[возвращён] {moved_path} -> {original_path}")
+        restored += 1
+        restored_bytes += actual_size
+
+    print("\nИтог отката:")
+    verb = "Было бы возвращено" if dry_run else "Возвращено файлов"
+    print(f"  {verb}: {restored} ({format_bytes(restored_bytes)})")
+    print(f"  Пропущено: {len(skipped)}")
+    for reason in skipped:
+        print(f"    - {reason}")
+    print(f"  Ошибок: {len(errors)}")
+    for error in errors:
+        print(f"ОШИБКА: {error}", file=sys.stderr)
+    if not dry_run and restored:
+        print("  Отчёт moved_duplicates.csv оставлен без изменений для истории.")
     return 1 if errors else 0
 
 
@@ -1585,7 +1780,16 @@ def create_unique_symlink(source: Path, directory: Path, link_name: str) -> Path
     return link_path
 
 
-def make_thumbnail(source: Path, destination: Path) -> bool:
+def make_thumbnail(
+    source: Path, destination: Path, max_size: tuple[int, int] = (360, 260),
+) -> bool:
+    """
+    Render a JPEG preview of an image or video frame.
+
+    max_size keeps the historical (360, 260) box by default; the visual review
+    of similar photos passes a larger box because tiny previews are useless
+    when the whole point is to eyeball two nearly identical shots.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
     extension = source.suffix.lower()
     if extension in SIMILAR_IMAGE_EXTENSIONS or extension == ".heif":
@@ -1594,7 +1798,7 @@ def make_thumbnail(source: Path, destination: Path) -> bool:
 
             with Image.open(source) as image:
                 image = ImageOps.exif_transpose(image)
-                image.thumbnail((360, 260))
+                image.thumbnail(max_size)
                 if image.mode not in {"RGB", "L"}:
                     background = Image.new("RGB", image.size, "white")
                     if "A" in image.getbands():
@@ -1612,7 +1816,7 @@ def make_thumbnail(source: Path, destination: Path) -> bool:
         command = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
             "-ss", "00:00:01", "-i", str(source), "-frames:v", "1",
-            "-vf", "scale='min(360,iw)':-2", str(destination),
+            "-vf", f"scale='min({int(max_size[0])},iw)':-2", str(destination),
         ]
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode == 0 and destination.is_file():
@@ -2451,8 +2655,68 @@ def group_similar_images(images: list[dict[str, object]], threshold: int) -> lis
     return [indices for indices in grouped.values() if len(indices) > 1]
 
 
+def image_sharpness(source: Path, long_side: int = 512) -> float:
+    """
+    Estimate sharpness as the variance of the Laplacian of a grayscale copy.
+
+    The image is first downscaled so its long side is about `long_side` pixels:
+    that keeps the cost low and makes the number comparable between photos of
+    different resolutions (a burst of the same scene shot at the same size).
+    A blurred frame has far less high-frequency energy, so its Laplacian
+    variance collapses towards zero, while a crisp frame stays high.
+
+    Returns 0.0 when the image cannot be read, so the caller can simply fall
+    back to the other criteria instead of failing the whole run.
+    """
+    try:
+        from PIL import Image, ImageFilter, ImageOps
+
+        with Image.open(source) as opened:
+            image = ImageOps.exif_transpose(opened).convert("L")
+            width, height = image.size
+            longest = max(width, height)
+            if longest > long_side and longest > 0:
+                scale = long_side / longest
+                image = image.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    Image.BILINEAR,
+                )
+            # 3x3 discrete Laplacian; scale=1/offset=0 keeps raw response values.
+            laplacian_kernel = ImageFilter.Kernel(
+                (3, 3), (0, 1, 0, 1, -4, 1, 0, 1, 0), scale=1, offset=0,
+            )
+            edges = image.filter(laplacian_kernel)
+            try:
+                import numpy
+
+                array = numpy.asarray(edges, dtype="float64")
+                return float(array.var()) if array.size >= 2 else 0.0
+            except ImportError:
+                values = list(edges.getdata())
+    except Exception:
+        return 0.0
+    count = len(values)
+    if count < 2:
+        return 0.0
+    mean = sum(values) / count
+    return sum((value - mean) ** 2 for value in values) / count
+
+
+def best_shot_score(sharpness: float, pixels: int, file_size: int) -> float:
+    """
+    Combine the objective criteria into one comparable score.
+
+    Sharpness dominates, resolution is the second voice and file size is only a
+    weak tie-breaker; the log-ish damping on pixels/size keeps a slightly bigger
+    but visibly blurred frame from ever beating a crisp one.
+    """
+    resolution_term = (pixels / 1_000_000.0) ** 0.5
+    size_term = (max(file_size, 0) / 1_000_000.0) ** 0.5
+    return sharpness + 25.0 * resolution_term + 0.5 * size_term
+
+
 def run_find_similar_photos_mode(
-    input_dir: Path, output_dir: Path, threshold: int,
+    input_dir: Path, output_dir: Path, threshold: int, best_shot: bool = False,
 ) -> int:
     try:
         from PIL import Image, ImageOps
@@ -2524,13 +2788,24 @@ def run_find_similar_photos_mode(
 
     for group_id, indices in enumerate(similar_index_groups, start=1):
         members = [images[index] for index in indices]
-        keeper = max(
-            members,
-            key=lambda item: (
-                int(item["width"]) * int(item["height"]),
-                int(item["size"]),
-            ),
-        )
+        if best_shot:
+            # Objective pick: sharpness first, then resolution, then file size.
+            for item in members:
+                item["sharpness"] = image_sharpness(item["path"])
+                item["best_shot_score"] = best_shot_score(
+                    float(item["sharpness"]),
+                    int(item["width"]) * int(item["height"]),
+                    int(item["size"]),
+                )
+            keeper = max(members, key=lambda item: float(item["best_shot_score"]))
+        else:
+            keeper = max(
+                members,
+                key=lambda item: (
+                    int(item["width"]) * int(item["height"]),
+                    int(item["size"]),
+                ),
+            )
         ordered = [keeper] + [item for item in members if item is not keeper]
         first_hash = keeper["hash"]
         review_duplicates += len(ordered) - 1
@@ -2555,7 +2830,7 @@ def run_find_similar_photos_mode(
 
             thumbnail_path = thumbnails_dir / f"{group_name}_{index:03d}.jpg"
             thumbnail = thumbnail_path if make_thumbnail(source, thumbnail_path) else None
-            report_rows.append({
+            row = {
                 "similar_group_id": group_id,
                 "file_path": str(source),
                 "file_size": item["size"],
@@ -2564,12 +2839,24 @@ def run_find_similar_photos_mode(
                 "perceptual_hash": str(item["hash"]),
                 "distance_from_first": distance,
                 "suggested_action": action,
-            })
+            }
+            if best_shot:
+                # Extra columns only in --best-shot runs, so a normal run keeps
+                # producing exactly the report older versions produced.
+                row["sharpness"] = f'{float(item["sharpness"]):.2f}'
+                row["best_shot_score"] = f'{float(item["best_shot_score"]):.2f}'
+            report_rows.append(row)
+            sharpness_html = (
+                f'резкость: {float(item["sharpness"]):.2f}, '
+                f'балл: {float(item["best_shot_score"]):.2f}<br>'
+                if best_shot else ""
+            )
             item_html.append(
                 f'<div class="item {"keep" if is_keeper else "review"}">'
                 f'<strong>{html.escape(action)}</strong>'
                 f'{thumbnail_html(thumbnail, output_dir, source.name)}'
                 f'<p>{item["width"]} x {item["height"]}, {html.escape(format_bytes(int(item["size"])))}<br>'
+                f'{sharpness_html}'
                 f'hash: <code>{html.escape(str(item["hash"]))}</code><br>'
                 f'distance: {distance}</p>'
                 f'<p><a href="{html.escape(source.as_uri())}">{html.escape(str(source))}</a></p>'
@@ -2593,12 +2880,15 @@ def run_find_similar_photos_mode(
         "similar_photos_review_folder_path": str(review_dir),
     }
     try:
+        report_fields = [
+            "similar_group_id", "file_path", "file_size", "image_width",
+            "image_height", "perceptual_hash", "distance_from_first",
+            "suggested_action",
+        ]
+        if best_shot:
+            report_fields += ["sharpness", "best_shot_score"]
         with (reports_dir / "similar_photos_report.csv").open("x", newline="", encoding="utf-8-sig") as handle:
-            writer = csv.DictWriter(handle, fieldnames=[
-                "similar_group_id", "file_path", "file_size", "image_width",
-                "image_height", "perceptual_hash", "distance_from_first",
-                "suggested_action",
-            ])
+            writer = csv.DictWriter(handle, fieldnames=report_fields)
             writer.writeheader()
             writer.writerows(report_rows)
         with (reports_dir / "similar_photos_summary.csv").open("x", newline="", encoding="utf-8-sig") as handle:
@@ -2621,6 +2911,8 @@ def run_find_similar_photos_mode(
         return 1
 
     print("Режим: поиск визуально похожих фото")
+    if best_shot:
+        print("Лучший кадр: keep_candidate выбран по резкости, разрешению и размеру")
     print(f"Изображений просканировано: {len(candidates)}")
     print(f"Групп похожих фото найдено: {len(similar_index_groups)}")
     print(f"Фото для ручной проверки: {review_duplicates}")
@@ -2629,6 +2921,369 @@ def run_find_similar_photos_mode(
     print(f"Открой {html_path} для ручной проверки.")
     open_output_folder(output_dir)
     return 0
+
+
+SIMILAR_REVIEW_THUMBNAIL_SIZE = (760, 760)
+
+
+def _similar_review_group_rank(rows: list[dict[str, str]]) -> tuple[int, float]:
+    """
+    Sort key for similar-photo groups: densest first.
+
+    More files in a group and smaller distances mean a tighter burst, which is
+    what a human wants to triage first. Returned as (-count, mean distance) so
+    plain ascending sorting puts the densest group on top.
+    """
+    distances: list[float] = []
+    for row in rows:
+        try:
+            distances.append(float((row.get("distance_from_first") or "").strip()))
+        except ValueError:
+            continue
+    mean_distance = sum(distances) / len(distances) if distances else 999.0
+    return (-len(rows), mean_distance)
+
+
+def apply_picks_to_report(report_path: Path, picks: dict[str, str]) -> tuple[int, int]:
+    """
+    Rewrite suggested_action in the similar-photos report from browser picks.
+
+    *picks* maps a group id to the file the user chose to keep. Within each
+    listed group the chosen row becomes keep_candidate and every other row
+    becomes review_duplicate; groups the user did not touch are left alone.
+
+    Only this one column is touched, so --trash-similar-from-report keeps
+    working on the result. Written via a temp file + os.replace, so an
+    interrupted save can never leave a half-written report behind.
+    """
+    with report_path.open("r", newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    groups_changed = 0
+    rows_changed = 0
+    for group_id, chosen in picks.items():
+        group_rows = [
+            row for row in rows
+            if (row.get("similar_group_id") or "").strip() == str(group_id).strip()
+        ]
+        if not group_rows:
+            continue
+        chosen_norm = str(chosen).strip()
+        if not any((row.get("file_path") or "").strip() == chosen_norm for row in group_rows):
+            continue  # picked file is not part of this group — ignore silently
+        touched = False
+        for row in group_rows:
+            is_chosen = (row.get("file_path") or "").strip() == chosen_norm
+            wanted = "keep_candidate" if is_chosen else "review_duplicate"
+            if (row.get("suggested_action") or "").strip() != wanted:
+                row["suggested_action"] = wanted
+                rows_changed += 1
+                touched = True
+        if touched:
+            groups_changed += 1
+
+    with tempfile.NamedTemporaryFile(
+        "w", newline="", encoding="utf-8-sig", delete=False,
+        dir=report_path.parent, prefix=f".{report_path.stem}.", suffix=".csv",
+    ) as temp:
+        temp_path = Path(temp.name)
+        writer = csv.DictWriter(temp, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temp_path, report_path)
+    return groups_changed, rows_changed
+
+
+def serve_similar_review(output_dir: Path, report_path: Path, page_name: str) -> None:
+    """
+    Serve the review page from localhost so picks can be saved back.
+
+    A plain file:// page cannot write to disk, so choosing in the browser needs
+    a helper. It binds to 127.0.0.1 on a free port, serves only *output_dir*,
+    and answers exactly one POST route. Runs until Ctrl-C.
+    """
+    import http.server
+    import json as _json
+    import webbrowser
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=str(output_dir), **kw)
+
+        def log_message(self, *args):  # noqa: D102 - keep the terminal readable
+            pass
+
+        def do_POST(self):  # noqa: N802 - name fixed by BaseHTTPRequestHandler
+            if self.path != "/save":
+                self.send_error(404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                picks = _json.loads(self.rfile.read(length) or b"{}")
+                groups, rows = apply_picks_to_report(report_path, picks)
+                message = (
+                    f"Сохранено. Групп изменено: {groups}, строк: {rows}."
+                    if rows else "Сохранено. Изменений не было."
+                )
+                print(f"  {message}")
+            except Exception as exc:  # noqa: BLE001 - report, never crash the server
+                message = f"Ошибка сохранения: {exc}"
+                print(f"  {message}", file=sys.stderr)
+            payload = _json.dumps({"message": message}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler) as httpd:
+        url = f"http://127.0.0.1:{httpd.server_address[1]}/{page_name}"
+        print(f"\nОткрой в браузере: {url}")
+        print("Отметь, какое фото оставить в каждой группе, и нажми «Сохранить выбор».")
+        print("Когда закончишь — заверши помощника клавишами Ctrl-C.")
+        try:
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 - opening a browser is a convenience
+            pass
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nПомощник остановлен. Отчёт сохранён.")
+
+
+def run_review_similar_photos_mode(
+    input_dir: Path, output_dir: Path, pick: bool = False,
+) -> int:
+    """
+    Build a visual HTML review from an existing similar_photos_report.csv.
+
+    Read-only with respect to the originals: it only renders thumbnails and one
+    self-contained HTML page into OUTPUT, so the "same photo or two different
+    ones?" question can finally be answered by looking instead of by comparing
+    hashes in a spreadsheet. Each group is laid out as a single row.
+    """
+    input_dir, output_dir = validate_paths(input_dir, output_dir)
+    report_path = output_dir / "reports" / "similar_photos_report.csv"
+    thumbnails_dir = output_dir / "similar_review_thumbnails"
+    html_path = output_dir / "similar_photos_visual_review.html"
+    if not report_path.is_file():
+        print(
+            f"Ошибка: не найден отчёт {report_path}. "
+            "Сначала выполните поиск похожих фото (--find-similar-photos).",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        ensure_output_artifacts_absent([thumbnails_dir, html_path])
+    except FileExistsError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 2
+
+    required_fields = {"similar_group_id", "file_path", "suggested_action"}
+    try:
+        with report_path.open("r", newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            missing = sorted(required_fields - set(reader.fieldnames or []))
+            if missing:
+                print(
+                    "Ошибка: в similar_photos_report.csv отсутствуют поля: "
+                    + ", ".join(missing),
+                    file=sys.stderr,
+                )
+                return 2
+            rows = list(reader)
+    except OSError as exc:
+        print(f"Ошибка чтения отчёта: {exc}", file=sys.stderr)
+        return 1
+
+    grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        group_id = (row.get("similar_group_id") or "").strip()
+        if group_id:
+            grouped[group_id].append(row)
+    ordered_groups = sorted(grouped.items(), key=lambda item: _similar_review_group_rank(item[1]))
+
+    thumbnails_dir.mkdir(parents=True, exist_ok=True)
+    html_groups: list[str] = []
+    missing_files = 0
+    rendered_thumbnails = 0
+
+    for position, (group_id, group_rows) in enumerate(ordered_groups, start=1):
+        # keep_candidate first, then the rest in report order.
+        group_rows = sorted(
+            group_rows,
+            key=lambda row: 0 if (row.get("suggested_action") or "").strip() == "keep_candidate" else 1,
+        )
+        item_html: list[str] = []
+        for index, row in enumerate(group_rows, start=1):
+            raw_path = (row.get("file_path") or "").strip()
+            source = Path(raw_path).expanduser()
+            action = (row.get("suggested_action") or "").strip() or "unknown"
+            is_keeper = action == "keep_candidate"
+            thumbnail = None
+            if source.is_file():
+                thumbnail_path = thumbnails_dir / f"group_{position:03d}_{index:03d}.jpg"
+                if make_thumbnail(source, thumbnail_path, SIMILAR_REVIEW_THUMBNAIL_SIZE):
+                    thumbnail = thumbnail_path
+                    rendered_thumbnails += 1
+            else:
+                missing_files += 1
+
+            width = (row.get("image_width") or "").strip()
+            height = (row.get("image_height") or "").strip()
+            resolution = f"{width} x {height}" if width and height else "разрешение неизвестно"
+            try:
+                size_text = format_bytes(int((row.get("file_size") or "").strip()))
+            except ValueError:
+                size_text = "размер неизвестен"
+            distance = (row.get("distance_from_first") or "").strip() or "-"
+            sharpness = (row.get("sharpness") or "").strip()
+            score = (row.get("best_shot_score") or "").strip()
+            extra_html = (
+                f'резкость: {html.escape(sharpness)}'
+                + (f', балл: {html.escape(score)}' if score else "")
+                + '<br>'
+                if sharpness else ""
+            )
+            badge = (
+                '<span class="badge badge-keep">ОСТАВИТЬ</span>' if is_keeper
+                else '<span class="badge badge-review">НА ПРОВЕРКУ</span>'
+            )
+            note = "" if thumbnail else (
+                '<p class="warn">Файл не найден на диске</p>' if not source.is_file()
+                else '<p class="warn">Миниатюру построить не удалось</p>'
+            )
+            picker = ""
+            if pick:
+                # One radio group per photo group: choosing a photo here is the
+                # whole point of the mode, so it sits above the thumbnail.
+                checked = " checked" if is_keeper else ""
+                picker = (
+                    f'<label class="pick"><input type="radio" '
+                    f'name="grp::{html.escape(group_id)}" '
+                    f'value="{html.escape(str(source))}"{checked}> оставить этот</label>'
+                )
+            item_html.append(
+                f'<div class="item {"keep" if is_keeper else "review"}" title="{html.escape(str(source))}">'
+                f'{picker}'
+                f'{badge}'
+                f'{thumbnail_html(thumbnail, output_dir, source.name)}'
+                f'{note}'
+                f'<p><strong>{html.escape(source.name)}</strong><br>'
+                f'{html.escape(resolution)}, {html.escape(size_text)}<br>'
+                f'{extra_html}'
+                f'distance: {html.escape(distance)}</p>'
+                f'<p><a href="{html.escape(_file_uri_or_text(source))}">Открыть в Finder</a></p>'
+                f'</div>'
+            )
+
+        html_groups.append(
+            f'<section class="group"><h2>Группа {html.escape(group_id)} '
+            f'({len(group_rows)} фото)</h2>'
+            f'<div class="items row">{"".join(item_html)}</div></section>'
+        )
+
+    body = SIMILAR_REVIEW_STYLE + (
+        (SIMILAR_PICK_STYLE + SIMILAR_PICK_PANEL) if pick else ""
+    ) + (
+        "".join(html_groups) or "<p>В отчёте нет групп похожих фото.</p>"
+    ) + (SIMILAR_PICK_SCRIPT if pick else "")
+    try:
+        html_path.write_text(
+            html_document("Похожие фото: визуальный обзор", body), encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"Ошибка записи отчёта: {exc}", file=sys.stderr)
+        return 1
+
+    print("Режим: визуальный обзор похожих фото")
+    print(f"Источник: {report_path}")
+    print(f"Групп в обзоре: {len(ordered_groups)}")
+    print(f"Миниатюр построено: {rendered_thumbnails}")
+    if missing_files:
+        print(f"Файлов не найдено на диске: {missing_files}")
+    print("Оригиналы не менялись и не удалялись.")
+    if pick:
+        # The page is useless as a plain file here: saving needs the helper.
+        serve_similar_review(output_dir, report_path, html_path.name)
+        return 0
+    print(f"Открой {html_path} для сравнения фото.")
+    open_output_folder(output_dir)
+    return 0
+
+
+def _file_uri_or_text(source: Path) -> str:
+    """Return a file:// URI, falling back to the raw path for odd inputs."""
+    try:
+        return source.resolve().as_uri()
+    except (ValueError, OSError):
+        return str(source)
+
+
+SIMILAR_PICK_STYLE = """<style>
+.pick { display:block; margin:0 0 8px; padding:6px 8px; border-radius:6px;
+        background:#eef2f7; font-weight:600; cursor:pointer; }
+.item.chosen { outline:3px solid #2f7d32; }
+.pickbar { position:sticky; top:0; z-index:5; background:#fff; padding:12px 0;
+           border-bottom:1px solid #ddd; margin-bottom:16px; }
+.pickbar button { font-size:16px; padding:8px 16px; cursor:pointer; }
+.pickbar .status { margin-left:12px; }
+</style>"""
+
+SIMILAR_PICK_PANEL = (
+    '<div class="pickbar">'
+    '<button id="save">Сохранить выбор</button>'
+    '<span class="status" id="status">Отметьте, какое фото оставить в каждой группе.</span>'
+    '</div>'
+)
+
+# Posts the chosen file of every group back to the local helper server, which
+# rewrites suggested_action in the report. Opened without that server (plain
+# file:// double-click) the fetch fails and the page says so instead of
+# pretending the choice was saved.
+SIMILAR_PICK_SCRIPT = """<script>
+function mark() {
+  document.querySelectorAll('.item').forEach(function (item) {
+    var radio = item.querySelector('input[type=radio]');
+    item.classList.toggle('chosen', !!(radio && radio.checked));
+  });
+}
+document.addEventListener('change', mark);
+mark();
+document.getElementById('save').addEventListener('click', function () {
+  var picks = {};
+  document.querySelectorAll('input[type=radio]:checked').forEach(function (radio) {
+    picks[radio.name.replace(/^grp::/, '')] = radio.value;
+  });
+  var status = document.getElementById('status');
+  status.textContent = 'Сохраняю…';
+  fetch('/save', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(picks)
+  }).then(function (r) { return r.json(); }).then(function (data) {
+    status.textContent = data.message;
+  }).catch(function () {
+    status.textContent = 'Не удалось сохранить: страница открыта без помощника. '
+      + 'Запустите режим с флагом --pick и откройте ссылку из терминала.';
+  });
+});
+</script>"""
+
+SIMILAR_REVIEW_STYLE = """<style>
+.items.row { display: flex; flex-wrap: nowrap; overflow-x: auto; gap: 16px;
+  grid-template-columns: none; padding-bottom: 8px; }
+.items.row .item { flex: 0 0 320px; }
+.items.row img { max-height: 420px; max-width: 300px; }
+.badge { display: inline-block; padding: 3px 10px; border-radius: 999px;
+  font-size: 0.8em; font-weight: 700; color: #fff; }
+.badge-keep { background: #248a3d; }
+.badge-review { background: #d67a00; }
+.warn { color: #b42318; font-size: 0.85em; }
+</style>
+"""
 
 
 def destination_for(source: Path, input_dir: Path, output_dir: Path) -> Path:
@@ -3102,6 +3757,24 @@ BITRATE_LEVEL_LABELS: dict[str, str] = {
     "manual": "вручную",
 }
 
+# --skip-already-compressed thresholds.
+ALREADY_EFFICIENT_VIDEO_CODECS = {"hevc", "h265", "av1"}
+# Bytes per pixel a typical photo occupies when saved as JPEG at quality 85.
+JPEG_REFERENCE_BPP_AT_85 = 0.20
+JPEG_MIN_USEFUL_GAIN = 0.10
+# Standard IJG luminance quantization table (JPEG Annex K), used to recover the
+# quality setting a JPEG was saved with from its own tables.
+JPEG_STANDARD_LUMA_TABLE = (
+    16, 11, 10, 16, 24, 40, 51, 61,
+    12, 12, 14, 19, 26, 58, 60, 55,
+    14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62,
+    18, 22, 37, 56, 68, 109, 103, 77,
+    24, 35, 55, 64, 81, 104, 113, 92,
+    49, 64, 78, 87, 103, 121, 120, 101,
+    72, 92, 95, 98, 112, 100, 103, 99,
+)
+
 MANUAL_BITRATE_MIN_KBPS = 500
 MANUAL_BITRATE_MAX_KBPS = 50000
 
@@ -3265,6 +3938,149 @@ def target_bitrate_kbps(
 
     floor_kbps = 800 if safe_height >= 720 else 300
     return max(floor_kbps, int(round(target_bps / 1000)))
+
+
+def probe_video_codec_name(source: Path) -> str:
+    """
+    Codec name of the first video stream ("hevc", "h264", "av1", ...), "" on failure.
+
+    Deliberately a tiny separate probe: video_bitrate_info() is shared with the
+    movie-MKV mode and its return shape must not change.
+    """
+    if shutil.which("ffprobe") is None:
+        return ""
+    cmd = [
+        "ffprobe", "-v", "quiet", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(source),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except Exception:  # noqa: BLE001
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip().splitlines()[0].strip().lower() if result.stdout.strip() else ""
+
+
+def crf_to_bitrate_level(crf: int) -> str:
+    """Map a --video-crf value onto the BITRATE_BPP_LEVELS scale."""
+    if crf <= 24:
+        return "high"
+    if crf <= 30:
+        return "balanced"
+    return "compact"
+
+
+def video_is_already_efficient(source: Path, crf: int) -> tuple[bool, str]:
+    """
+    True when re-encoding *source* would cost hours and buy almost nothing.
+
+    Two conditions must BOTH hold: the video is already in a modern codec
+    (HEVC/H.265 or AV1), and its bitrate per pixel is already at or below what
+    this run would target anyway.  The target comes from target_bitrate_kbps()
+    with source_bitrate_bps=0, i.e. the pure bits-per-pixel figure without the
+    "never exceed 90% of source" ceiling — the ceiling would drag the target
+    below the source by construction and make the comparison meaningless.
+
+    Any probe failure returns False: an unknown file is compressed as usual.
+    """
+    codec = probe_video_codec_name(source)
+    if codec not in ALREADY_EFFICIENT_VIDEO_CODECS:
+        return False, ""
+    info = video_bitrate_info(source, -1)
+    width = int(info.get("width", 0) or 0)
+    height = int(info.get("height", 0) or 0)
+    source_bps = int(info.get("source_bitrate_bps", 0) or 0)
+    if width <= 0 or height <= 0 or source_bps <= 0:
+        return False, ""
+    target_kbps = target_bitrate_kbps(
+        width, height, float(info.get("fps", 0.0) or 0.0), 0, crf_to_bitrate_level(crf),
+    )
+    if source_bps > target_kbps * 1000:
+        return False, ""
+    codec_label = "AV1" if codec == "av1" else "HEVC/H.265"
+    return True, (
+        f"Уже эффективно сжат: {codec_label}, {source_bps / 1_000_000:.1f} Мбит/с "
+        f"при целевых {target_kbps / 1000:.1f} Мбит/с для {width}x{height}; "
+        "пережатие только испортило бы качество"
+    )
+
+
+def estimate_jpeg_quality(quantization: dict[int, list[int]]) -> int:
+    """
+    Recover the IJG quality setting a JPEG was saved with, 0 when unknown.
+
+    The encoder scales the standard luminance table by a factor derived from
+    the quality setting, so the ratio between the file's table and the standard
+    one inverts back to that quality.  Accurate to a couple of points, which is
+    all the skip decision needs.
+    """
+    table = quantization.get(0)
+    if not table or len(table) < len(JPEG_STANDARD_LUMA_TABLE):
+        return 0
+    ratios = [
+        value / standard
+        for value, standard in zip(table, JPEG_STANDARD_LUMA_TABLE)
+        if standard > 0 and value > 0
+    ]
+    if not ratios:
+        return 0
+    scale = (sum(ratios) / len(ratios)) * 100.0
+    if scale <= 0:
+        return 0
+    quality = 5000.0 / scale if scale > 100.0 else (200.0 - scale) / 2.0
+    return max(1, min(100, int(round(quality))))
+
+
+def jpeg_is_already_efficient(
+    source: Path, quality: int, original_size: int,
+) -> tuple[bool, str]:
+    """
+    True when re-saving this JPEG at *quality* would gain under ~10%.
+
+    Primary test — the quantization tables in the file's header, which say what
+    quality it was already saved with.  A photo stored at quality 85 re-saved at
+    quality 85 barely shrinks but does pick up a second generation of artefacts,
+    so anything already at or below the target quality is left alone.
+
+    Fallback, for files whose tables cannot be read — bytes per pixel against
+    JPEG_REFERENCE_BPP_AT_85 scaled to the requested quality.
+
+    Either way only the header is parsed; the pixel data is never decoded.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return False, ""
+    try:
+        with Image.open(source) as image:
+            width, height = image.size
+            quantization = dict(getattr(image, "quantization", {}) or {})
+    except Exception:  # noqa: BLE001
+        return False, ""
+    pixels = width * height
+    if pixels <= 0 or original_size <= 0:
+        return False, ""
+
+    source_quality = estimate_jpeg_quality(quantization)
+    if source_quality:
+        if source_quality > quality:
+            return False, ""
+        return True, (
+            f"Уже сжат с качеством ~{source_quality} при целевых {quality}; "
+            "пережатие не уменьшит файл, но добавит артефактов"
+        )
+
+    expected_bytes = pixels * JPEG_REFERENCE_BPP_AT_85 * (quality / 85.0)
+    expected_gain = (original_size - expected_bytes) / original_size
+    if expected_gain >= JPEG_MIN_USEFUL_GAIN:
+        return False, ""
+    current_bpp = original_size / pixels
+    return True, (
+        f"Уже экономно сохранён: {current_bpp:.2f} байт/пиксель при {width}x{height}; "
+        f"ожидаемый выигрыш ~{max(0.0, expected_gain) * 100:.0f}% меньше "
+        f"{int(JPEG_MIN_USEFUL_GAIN * 100)}%, пережатие только ухудшило бы картинку"
+    )
 
 
 def bitrate_is_pointless(target_kbps: int, source_bitrate_bps: int) -> bool:
@@ -4716,8 +5532,11 @@ def main() -> int:
         return run_review_duplicates_mode(args.input, args.output)
     if args.find_similar_photos:
         return run_find_similar_photos_mode(
-            args.input, args.output, args.similar_threshold
+            args.input, args.output, args.similar_threshold,
+            best_shot=getattr(args, "best_shot", False),
         )
+    if getattr(args, "review_similar_photos", False):
+        return run_review_similar_photos_mode(args.input, args.output, args.pick)
     if args.trash_similar_from_report:
         return run_trash_similar_from_report_mode(
             args.input, args.output, args.dry_run
@@ -4734,8 +5553,13 @@ def main() -> int:
         return run_trash_similar_videos_from_report_mode(
             args.input, args.output, args.dry_run
         )
+    if args.undo_move_duplicates:
+        return run_undo_move_duplicates_mode(args.input, args.output, args.dry_run)
     if args.move_duplicates:
-        return run_move_duplicates_mode(args.input, args.output, args.dry_run)
+        return run_move_duplicates_mode(
+            args.input, args.output, args.dry_run,
+            fast=getattr(args, "fast_duplicates", False),
+        )
     try:
         input_dir, output_dir = validate_paths(args.input, args.output)
     except ValueError as exc:
@@ -4744,7 +5568,10 @@ def main() -> int:
 
     files = collect_files(input_dir)
     if args.duplicates_only:
-        return run_duplicates_only(files, input_dir, output_dir, args.dry_run)
+        return run_duplicates_only(
+            files, input_dir, output_dir, args.dry_run,
+            fast=getattr(args, "fast_duplicates", False),
+        )
 
     try:
         validate_report_destinations(files, input_dir, output_dir, args.dry_run)
@@ -4780,7 +5607,9 @@ def main() -> int:
         ):
             print(line)
     counters = Counters(total=len(files))
-    duplicate_rows, counters.duplicates, duplicate_errors = find_duplicates(files, input_dir)
+    duplicate_rows, counters.duplicates, duplicate_errors = find_duplicates(
+        files, input_dir, fast=getattr(args, "fast_duplicates", False),
+    )
     errors = list(duplicate_errors)
     summary_rows: list[dict[str, object]] = []
     total_videos = sum(classify(path) == "video" for path in files)
@@ -4816,6 +5645,24 @@ def main() -> int:
             print(f"ОШИБКА: {message}")
             continue
 
+        # --skip-already-compressed: decided BEFORE the destination is reserved,
+        # because a file that is only copied must keep its original container
+        # extension instead of being renamed to .mp4.
+        skip_note = ""
+        if getattr(args, "skip_already_compressed", False):
+            if category == "video":
+                is_efficient, skip_reason = video_is_already_efficient(source, args.video_crf)
+            elif category == "jpeg":
+                is_efficient, skip_reason = jpeg_is_already_efficient(
+                    source, args.image_quality, original_size,
+                )
+            else:
+                is_efficient, skip_reason = False, ""
+            if is_efficient:
+                skip_note = skip_reason
+                action = "copy-already-efficient"
+                destination = output_dir / source.relative_to(input_dir)
+
         collision_note = ""
         if args.dry_run:
             # Mirror the real run exactly: same collision handling, same names.
@@ -4833,6 +5680,10 @@ def main() -> int:
             already_there = destination.exists()
             status = "would-skip-existing" if already_there else "planned"
             note = "Файл уже существует; не будет перезаписан" if already_there else ""
+            if skip_note:
+                if not already_there:
+                    status = "would-skip-already-efficient"
+                note = f"{note}; {skip_note}" if note else skip_note
             if collision_note:
                 note = f"{note}; {collision_note}" if note else collision_note
             if not already_there:
@@ -4888,7 +5739,11 @@ def main() -> int:
             continue
 
         try:
-            if category == "video":
+            if skip_note:
+                # Still lands in output, just byte-for-byte instead of re-encoded.
+                output_size = copy_safely(source, destination)
+                note = skip_note
+            elif category == "video":
                 print(
                     f"[video {current_video}/{total_videos}] "
                     f"Обрабатываю: {source.relative_to(input_dir)}",
@@ -4907,7 +5762,12 @@ def main() -> int:
                 note = "Скопирован без изменений"
             counters.original_bytes += original_size
             counters.output_bytes += output_size
-            if category == "video":
+            if skip_note:
+                print(
+                    f"[пропущено] {source.relative_to(input_dir)} "
+                    f"({format_bytes(original_size)}) — {skip_note}"
+                )
+            elif category == "video":
                 saved_size = original_size - output_size
                 print(
                     f"[готово] {source.relative_to(input_dir)}, "
@@ -4921,7 +5781,8 @@ def main() -> int:
                 note = f"{note}; {collision_note}" if note else collision_note
             summary_rows.append(make_summary_row(
                 source, destination, input_dir, output_dir, category, action,
-                "completed", original_size, output_size, note,
+                "skipped-already-efficient" if skip_note else "completed",
+                original_size, output_size, note,
             ))
         except Exception as exc:
             destination.unlink(missing_ok=True)
