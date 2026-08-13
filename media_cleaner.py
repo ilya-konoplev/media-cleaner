@@ -5828,31 +5828,30 @@ def run_photo_convert_mode(
             ))
             continue
 
+        # Names are allocated here but the file is NOT created yet. Reserving all
+        # destinations up front would mean an interrupt leaves one empty file per
+        # planned photo, and the next run then skips every one of them as
+        # "already there" — silently losing them from the archive for good.
+        # The actual O_EXCL reservation happens in phase 2, right before writing.
+        if destination in occupied:
+            destination = unique_path_for_existing_target(destination, occupied)
+            collision_note = "Имя изменено: занято другим исходным файлом этого запуска"
         try:
-            if not reserve_destination(destination):
-                if destination in occupied:
-                    renamed = unique_path_for_existing_target(destination, occupied)
-                    if not reserve_destination(renamed):
-                        raise OSError(f"не удалось зарезервировать имя {renamed.name}")
-                    collision_note = "Имя изменено: занято другим исходным файлом этого запуска"
-                    destination = renamed
-                    occupied.add(destination)
-                else:
-                    # Present before this run started: not ours, left strictly alone.
-                    print(f"[skip-existing] {destination.relative_to(output_dir)}")
-                    summary_rows.append(make_summary_row(
-                        source, destination, input_dir, output_dir, category, action,
-                        "skipped", original_size, destination.stat().st_size,
-                        "Файл уже существует; пропущен без перезаписи",
-                    ))
-                    continue
-            else:
-                occupied.add(destination)
+            if destination.exists():
+                # Present before this run started: not ours, left strictly alone.
+                print(f"[skip-existing] {destination.relative_to(output_dir)}")
+                summary_rows.append(make_summary_row(
+                    source, destination, input_dir, output_dir, category, action,
+                    "skipped", original_size, destination.stat().st_size,
+                    "Файл уже существует; пропущен без перезаписи",
+                ))
+                continue
         except OSError as exc:
             errors.append(f"{source}: {exc}")
             counters.errors += 1
             print(f"ОШИБКА: {source.relative_to(input_dir)}: {exc}")
             continue
+        occupied.add(destination)
 
         jobs_to_run.append({
             "source": source, "destination": destination, "target": target,
@@ -5869,6 +5868,10 @@ def run_photo_convert_mode(
         source, destination = job["source"], job["destination"]
         target = job["target"]
         try:
+            # Claimed here, not in phase 1, so an interrupt can strand at most the
+            # handful of files actually in flight instead of every planned one.
+            if not reserve_destination(destination):
+                raise FileExistsError("файл появился в output уже во время работы")
             if target is None:
                 output_size = copy_safely(source, destination)
                 note = "Скопирован без изменений"
@@ -5900,14 +5903,40 @@ def run_photo_convert_mode(
                 )
         return result
 
+    def drop_unfinished() -> int:
+        """Remove destinations we claimed but never filled, so a re-run redoes them."""
+        removed = 0
+        for job in jobs_to_run:
+            path = job["destination"]
+            try:
+                if path.exists() and path.stat().st_size == 0:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        return removed
+
     results: list[dict[str, object]]
-    if workers > 1 and len(jobs_to_run) > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            # Submitted in order, collected in order: parallel work, but a
-            # report and a console log that still read top to bottom.
-            results = list(pool.map(run_one, jobs_to_run))
-    else:
-        results = [run_one(job) for job in jobs_to_run]
+    try:
+        if workers > 1 and len(jobs_to_run) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                # Submitted in order, collected in order: parallel work, but a
+                # report and a console log that still read top to bottom.
+                results = list(pool.map(run_one, jobs_to_run))
+        else:
+            results = [run_one(job) for job in jobs_to_run]
+    except KeyboardInterrupt:
+        # An empty reserved file would be indistinguishable from a finished one on
+        # the next run, which is exactly how photos went missing before.
+        stranded = drop_unfinished()
+        print(
+            f"\n\nОстановлено. Готовые файлы сохранены в {output_dir}"
+            + (f", незавершённых убрано: {stranded}" if stranded else "")
+            + ".\nОригиналы не тронуты. Запустите ту же команду ещё раз, "
+              "чтобы доделать остальные.",
+            file=sys.stderr,
+        )
+        return 130
 
     # Aggregation stays sequential and in input order, so summary.csv reads the
     # same way whether the run was parallel or not.
