@@ -23,6 +23,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1018,12 +1019,44 @@ def run_quick_file_mode(
         return 1
 
 
-def write_move_duplicates_reports(
+MOVED_DUPLICATES_FIELDS = ["duplicate_group_id", "original_path", "moved_to", "file_size", "sha256"]
+
+
+def open_moved_duplicates_writer(output_dir: Path):
+    """
+    Open reports/moved_duplicates.csv for incremental writes.
+
+    Opened once, before the first file is moved, then written a row at a time
+    as each move actually succeeds (see run_move_duplicates_mode), flushing
+    after every row. That is what makes the report usable at any point during
+    the run: a Ctrl+C, a crash, or a full disk between moves used to leave
+    files already sitting in Duplicates_To_Delete with no return map at all,
+    because the CSV was written only once, after the whole loop finished.
+    Column set, order, header and encoding are unchanged from before, since
+    run_undo_move_duplicates_mode and older reports depend on this exact
+    shape.
+    """
+    reports_dir = output_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    handle = (reports_dir / "moved_duplicates.csv").open("x", newline="", encoding="utf-8-sig")
+    writer = csv.DictWriter(handle, fieldnames=MOVED_DUPLICATES_FIELDS)
+    writer.writeheader()
+    handle.flush()
+    return handle, writer
+
+
+def write_duplicates_and_summary_reports(
     output_dir: Path,
     duplicate_rows: list[dict[str, object]],
-    moved_rows: list[dict[str, object]],
     summary_row: dict[str, object],
 ) -> None:
+    """
+    Write duplicates_report.csv and summary.csv.
+
+    moved_duplicates.csv is deliberately not written here — it is written
+    incrementally row by row as files actually move; see
+    open_moved_duplicates_writer.
+    """
     reports_dir = output_dir / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     with (reports_dir / "duplicates_report.csv").open("x", newline="", encoding="utf-8-sig") as handle:
@@ -1036,13 +1069,6 @@ def write_move_duplicates_reports(
         )
         writer.writeheader()
         writer.writerows(duplicate_rows)
-    with (reports_dir / "moved_duplicates.csv").open("x", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=["duplicate_group_id", "original_path", "moved_to", "file_size", "sha256"],
-        )
-        writer.writeheader()
-        writer.writerows(moved_rows)
     with (reports_dir / "summary.csv").open("x", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(
             handle,
@@ -1075,53 +1101,144 @@ def run_move_duplicates_mode(
     errors = list(duplicate_errors)
     cleanup_root = output_dir / "Duplicates_To_Delete"
     occupied_targets = DestinationRegistry(filesystem_folds_case(output_dir))
+    moved_report_path = output_dir / "reports" / "moved_duplicates.csv"
 
-    for group in duplicate_groups:
-        first_copy = True
-        for source in group["paths"]:
-            planned_action = "keep_in_place" if first_copy else (
-                "would_move_to_duplicates_folder" if dry_run else "move_to_duplicates_folder"
-            )
-            planned_rows.append({
-                "duplicate_group_id": group["group_id"],
-                "file_path": str(source),
-                "file_size": group["size_bytes"],
-                "sha256": group["sha256"],
-                "is_first_copy": "yes" if first_copy else "no",
-                "planned_action": planned_action,
-            })
-            if first_copy:
+    print("Режим: безопасное перемещение лишних дубликатов")
+    print(f"Input:  {input_dir}")
+    print(f"Output: {output_dir}")
+    print(f"Duplicates_To_Delete: {cleanup_root}")
+    print(f"Файлов просканировано: {len(files)}")
+    print(f"Групп дубликатов найдено: {len(duplicate_groups)}")
+    print(f"Лишних копий найдено: {extra_copies}")
+    print("Минимум одна копия каждого файла останется на месте.")
+    print("Ничего не будет удалено навсегда.")
+
+    # Opened up front, before the first move, and written to (with a flush)
+    # after every successful move. That way an interrupted or crashed run
+    # still leaves a moved_duplicates.csv that accounts for exactly the files
+    # that actually left their original location — see
+    # open_moved_duplicates_writer for why. DRY-RUN never opens this: it must
+    # not create or write anything on disk.
+    moved_handle = None
+    moved_writer = None
+    if not dry_run:
+        try:
+            moved_handle, moved_writer = open_moved_duplicates_writer(output_dir)
+        except OSError as exc:
+            print(f"Ошибка записи отчётов: {exc}", file=sys.stderr)
+            return 1
+
+    # A plain KeyboardInterrupt can land between shutil.move() completing and
+    # the matching row being written to moved_duplicates.csv — Python delivers
+    # SIGINT asynchronously, between arbitrary bytecode instructions. Left
+    # alone, that reopens exactly the bug this rewrite is meant to close: a
+    # file sitting in Duplicates_To_Delete with no line for it in the CSV.
+    # So for real runs SIGINT is deferred (caught by _defer_sigint below,
+    # which only raises a flag) for the width of one file's move+write, and
+    # only turned into an actual KeyboardInterrupt at the boundary between
+    # files, once that file's move and its report row are both done or both
+    # skipped. DRY-RUN never touches the signal handler: nothing it does
+    # needs this protection, and it must still stop the instant Ctrl-C is
+    # pressed like every other read-only mode.
+    sigint_flag = {"raised": False}
+
+    def _defer_sigint(signum, frame):
+        sigint_flag["raised"] = True
+
+    previous_sigint_handler = None
+    if not dry_run:
+        previous_sigint_handler = signal.signal(signal.SIGINT, _defer_sigint)
+
+    interrupted = False
+    try:
+        for group in duplicate_groups:
+            first_copy = True
+            for source in group["paths"]:
+                is_first = first_copy
                 first_copy = False
-                continue
+                planned_action = "keep_in_place" if is_first else (
+                    "would_move_to_duplicates_folder" if dry_run else "move_to_duplicates_folder"
+                )
+                planned_rows.append({
+                    "duplicate_group_id": group["group_id"],
+                    "file_path": str(source),
+                    "file_size": group["size_bytes"],
+                    "sha256": group["sha256"],
+                    "is_first_copy": "yes" if is_first else "no",
+                    "planned_action": planned_action,
+                })
 
-            planned_destination = unique_path_for_existing_target(
-                cleanup_root / source.relative_to(input_dir), occupied_targets
+                if not is_first:
+                    planned_destination = unique_path_for_existing_target(
+                        cleanup_root / source.relative_to(input_dir), occupied_targets
+                    )
+                    occupied_targets.add(planned_destination)
+                    if dry_run:
+                        moved_rows.append({
+                            "duplicate_group_id": group["group_id"],
+                            "original_path": str(source),
+                            "moved_to": str(planned_destination),
+                            "file_size": group["size_bytes"],
+                            "sha256": group["sha256"],
+                        })
+                        moved_bytes += group["size_bytes"]
+                    else:
+                        try:
+                            planned_destination.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(source), str(planned_destination))
+                        except Exception as exc:
+                            errors.append(f"{source}: {exc}")
+                        else:
+                            row = {
+                                "duplicate_group_id": group["group_id"],
+                                "original_path": str(source),
+                                "moved_to": str(planned_destination),
+                                "file_size": group["size_bytes"],
+                                "sha256": group["sha256"],
+                            }
+                            moved_rows.append(row)
+                            moved_bytes += group["size_bytes"]
+                            try:
+                                moved_writer.writerow(row)
+                                moved_handle.flush()
+                            except OSError as exc:
+                                # The move already happened; only the paper
+                                # trail failed. Recorded as an error so it
+                                # shows up in the count, but worded so
+                                # nobody reads it as "the file was not
+                                # moved".
+                                errors.append(
+                                    f"{source}: перемещён, но запись в отчёт не удалась: {exc}"
+                                )
+
+                # Clean per-file boundary: the move (if any) and its report
+                # row are both settled, so this is a safe point to honor a
+                # deferred Ctrl-C.
+                if sigint_flag["raised"]:
+                    raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        if dry_run:
+            print(
+                "\n\nDRY-RUN остановлен. Ничего не перемещалось и не записывалось.",
+                file=sys.stderr,
             )
-            occupied_targets.add(planned_destination)
-            if dry_run:
-                moved_rows.append({
-                    "duplicate_group_id": group["group_id"],
-                    "original_path": str(source),
-                    "moved_to": str(planned_destination),
-                    "file_size": group["size_bytes"],
-                    "sha256": group["sha256"],
-                })
-                moved_bytes += group["size_bytes"]
-                continue
+            return 130
+        interrupted = True
+    finally:
+        if previous_sigint_handler is not None:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+        if moved_handle is not None:
+            moved_handle.close()
 
-            try:
-                planned_destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(source), str(planned_destination))
-                moved_rows.append({
-                    "duplicate_group_id": group["group_id"],
-                    "original_path": str(source),
-                    "moved_to": str(planned_destination),
-                    "file_size": group["size_bytes"],
-                    "sha256": group["sha256"],
-                })
-                moved_bytes += group["size_bytes"]
-            except Exception as exc:
-                errors.append(f"{source}: {exc}")
+    if interrupted:
+        print(
+            f"\n\nОстановлено. Перемещено файлов: {len(moved_rows)}.\n"
+            f"Карта возврата сохранена: {moved_report_path}.\n"
+            "Оригиналы перемещённых файлов не тронуты, они лежат в Duplicates_To_Delete.\n"
+            "Для отката используйте --undo-move-duplicates.",
+            file=sys.stderr,
+        )
+        return 130
 
     summary_row = {
         "total_files_scanned": len(files),
@@ -1131,30 +1248,18 @@ def run_move_duplicates_mode(
         "human_readable_moved_size": format_bytes(moved_bytes),
         "errors_count": len(errors),
     }
-
-    print("Режим: безопасное перемещение лишних дубликатов")
-    print(f"Input:  {input_dir}")
-    print(f"Output: {output_dir}")
-    print(f"Duplicates_To_Delete: {cleanup_root}")
-    print(f"Файлов просканировано: {len(files)}")
-    print(f"Групп дубликатов найдено: {len(duplicate_groups)}")
-    print(f"Лишних копий найдено: {extra_copies}")
     print(f"Можно освободить: {format_bytes(moved_bytes)}")
-    print("Минимум одна копия каждого файла останется на месте.")
-    print("Ничего не будет удалено навсегда.")
 
-    try:
-        write_move_duplicates_reports(output_dir, planned_rows, moved_rows, summary_row)
-    except OSError as exc:
-        print(f"Ошибка записи отчётов: {exc}", file=sys.stderr)
-        return 1
+    if not dry_run:
+        try:
+            write_duplicates_and_summary_reports(output_dir, planned_rows, summary_row)
+        except OSError as exc:
+            print(f"Ошибка записи отчётов: {exc}", file=sys.stderr)
+            return 1
 
     if dry_run:
-        print("DRY-RUN: ничего не перемещалось.")
-    elif errors:
-        for error in errors:
-            print(f"ОШИБКА: {error}", file=sys.stderr)
-    if dry_run and errors:
+        print("DRY-RUN: ничего не перемещалось и не записывалось.")
+    if errors:
         for error in errors:
             print(f"ОШИБКА: {error}", file=sys.stderr)
 
