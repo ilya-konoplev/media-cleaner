@@ -2,11 +2,12 @@
 """
 Media Cleaner: a local, safe toolkit for a personal media archive.
 
-Covers four jobs, all writing into a separate folder and never touching the
-originals: compressing photos and videos, finding exact duplicates by SHA256,
-finding visually similar photos and videos by perceptual hash, and remuxing or
-re-encoding movies and TV series into MKV with explicit audio/subtitle track
-selection. Run without arguments to open the interactive wizard.
+Covers five jobs, all writing into a separate folder and never touching the
+originals: compressing photos and videos, converting photos (including camera
+RAW) into a chosen format, finding exact duplicates by SHA256, finding visually
+similar photos and videos by perceptual hash, and remuxing or re-encoding movies
+and TV series into MKV with explicit audio/subtitle track selection. Run without
+arguments to open the interactive wizard.
 """
 
 from __future__ import annotations
@@ -231,6 +232,27 @@ def parse_args() -> argparse.Namespace:
         "--image-quality", type=int, default=85, choices=range(1, 101), metavar="1..100",
         help="Качество JPEG от 1 до 100 (по умолчанию: 85)",
     )
+    parser.add_argument(
+        "--convert-photos", action="store_true",
+        help=(
+            "Конвертировать и/или сжать все фото из INPUT в один формат. "
+            "Читает в том числе RAW (.arw, .cr2, .nef и другие)"
+        ),
+    )
+    parser.add_argument(
+        "--photo-format", default="heic", choices=[*PHOTO_FORMATS, "keep"],
+        help=(
+            "Формат на выходе для --convert-photos (по умолчанию: heic). "
+            "keep — не менять формат, только пережать"
+        ),
+    )
+    parser.add_argument(
+        "--photo-level", default="none", choices=list(PHOTO_LEVEL_LABELS),
+        help=(
+            "Насколько сильно сжимать при --convert-photos "
+            "(по умолчанию: none — максимальное качество)"
+        ),
+    )
     args = parser.parse_args()
     args.wizard_cancelled = False
     args.movie_mkv = None  # populated by run_wizard_movie_mkv if chosen
@@ -251,6 +273,7 @@ def parse_args() -> argparse.Namespace:
         args.find_similar_photos, args.trash_similar_from_report,
         args.find_similar_videos, args.trash_similar_videos_from_report,
         args.undo_move_duplicates, args.review_similar_photos,
+        args.convert_photos,
     ]
     if args.best_shot and not args.find_similar_photos:
         parser.error("--best-shot работает только вместе с --find-similar-photos")
@@ -410,12 +433,13 @@ def run_wizard(args: argparse.Namespace) -> argparse.Namespace | None:
     print("  9. Найти визуально похожие видео")
     print(" 10. Удалить похожие видео из отчёта в корзину")
     print(" 11. Пересобрать фильмы/сериалы в MKV: выбор дорожек, со сжатием или без")
-    print(" 12. Выйти")
+    print(" 12. Сжатие/конвертация фото (в том числе RAW: .arw, .cr2, .nef)")
+    print(" 13. Выйти")
     mode = prompt_menu(
-        "Выберите 1-12: ",
-        {"1","2","3","4","5","6","7","8","9","10","11","12"},
+        "Выберите 1-13: ",
+        {"1","2","3","4","5","6","7","8","9","10","11","12","13"},
     )
-    if mode == "12":
+    if mode == "13":
         print("Запуск отменён.")
         return None
 
@@ -435,6 +459,8 @@ def run_wizard(args: argparse.Namespace) -> argparse.Namespace | None:
         return run_wizard_trash_similar_videos(args)
     if mode == "11":
         return run_wizard_movie_mkv(args)
+    if mode == "12":
+        return run_wizard_photo_convert(args)
 
     while True:
         input_value = input("\nВставьте или перетащите input-папку в Terminal: ")
@@ -5443,6 +5469,476 @@ def print_totals(counters: Counters, dry_run: bool) -> None:
         print(f"  Примерная экономия места: {format_bytes(counters.original_bytes - counters.output_bytes)}")
 
 
+# ---------------------------------------------------------------------------
+# Photo conversion mode: decode any photo, encode to a chosen format
+#
+# Deliberately separate from the archive-compression pipeline above. That
+# pipeline is built around video (CRF, encoder probing, ffmpeg progress) and
+# hard-codes JPEG as the only re-encoded image type; threading a target format
+# through it would put every existing compression run at risk for no gain.
+# compress_jpeg() and the archive pipeline stay untouched.
+#
+# On macOS every conversion goes through sips, which reads all the RAW formats
+# plus jpg/png/heic/webp/tiff, writes jpeg/heic/avif/png, and preserves EXIF in
+# all of them. One code path, one quality scale. Pillow (+ pillow-heif, + rawpy
+# for RAW) is the fallback on other platforms and uses its own scale.
+# ---------------------------------------------------------------------------
+
+# Everything worth re-encoding. Anything else in the folder is copied as-is.
+PHOTO_CONVERT_EXTENSIONS = (
+    JPEG_EXTENSIONS
+    | {".png", ".heic", ".heif", ".webp", ".tif", ".tiff", ".bmp", ".gif"}
+    | RAW_EXTENSIONS
+)
+
+# Target formats, in the order the wizard offers them. The advice is printed as
+# the menu line itself, so it is read at the moment of choosing rather than on
+# some separate help screen.
+PHOTO_FORMATS: dict[str, dict[str, object]] = {
+    "heic": {
+        "suffix": ".heic", "pillow": "HEIF", "lossless": False,
+        "advice": "в 1.5 раза меньше JPEG, кодируется аппаратно. "
+                  "Плохо открывается на Windows/Android",
+    },
+    "jpeg": {
+        "suffix": ".jpg", "pillow": "JPEG", "lossless": False,
+        "advice": "откроется абсолютно везде, самый крупный из сжатых",
+    },
+    "avif": {
+        "suffix": ".avif", "pillow": "AVIF", "lossless": False,
+        "advice": "самый маленький, но старые программы его не поймут",
+    },
+    "png": {
+        "suffix": ".png", "pillow": "PNG", "lossless": True,
+        "advice": "без потерь, для скриншотов и графики; для фото очень крупный",
+    },
+}
+
+PHOTO_LEVEL_LABELS = {
+    "none": "не сжимать (максимальное качество)",
+    "light": "осторожно",
+    "normal": "нормально",
+    "strong": "сильно",
+}
+
+# Quality numbers per format per level. Two separate tables because the sips and
+# Pillow scales genuinely differ: sips jpeg 60 lands where Pillow jpeg 85 does.
+# Calibrated by measuring a 24.9 MB / 6000x4000 Sony ARW through both encoders,
+# so that one level means roughly one visual result across all formats.
+PHOTO_QUALITY_SIPS = {
+    "heic": {"none": 80, "light": 70, "normal": 60, "strong": 50},
+    "jpeg": {"none": 95, "light": 85, "normal": 75, "strong": 60},
+    "avif": {"none": 85, "light": 75, "normal": 70, "strong": 60},
+}
+PHOTO_QUALITY_PILLOW = {
+    "heic": {"none": 90, "light": 80, "normal": 70, "strong": 60},
+    "jpeg": {"none": 95, "light": 90, "normal": 85, "strong": 75},
+    "avif": {"none": 80, "light": 70, "normal": 55, "strong": 45},
+}
+
+
+def photo_format_of(path: Path) -> str | None:
+    """The target-format key a file already is, or None if we cannot write it."""
+    extension = path.suffix.lower()
+    if extension in JPEG_EXTENSIONS:
+        return "jpeg"
+    if extension in {".heic", ".heif"}:
+        return "heic"
+    if extension == ".avif":
+        return "avif"
+    if extension == ".png":
+        return "png"
+    return None
+
+
+def sips_available() -> bool:
+    return is_macos() and shutil.which("sips") is not None
+
+
+def convert_photo_sips(source: Path, temp_path: Path, target: str, quality: int) -> None:
+    """Decode and encode in one sips call. Keeps EXIF; no intermediate file."""
+    # Format names are sips' own: it writes "heic" and rejects "heif".
+    command = ["sips", "-s", "format", target]
+    if not PHOTO_FORMATS[target]["lossless"]:
+        command += ["-s", "formatOptions", str(quality)]
+    command += [str(source), "--out", str(temp_path)]
+    result = subprocess.run(command, capture_output=True, text=True)
+    # sips reports several real failures on stdout with a zero exit code, so the
+    # written file is what we actually trust.
+    if result.returncode != 0 or not temp_path.exists() or temp_path.stat().st_size == 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        raise RuntimeError(
+            f"sips не смог конвертировать файл: {detail[-1] if detail else 'причина неизвестна'}"
+        )
+
+
+def load_photo_pillow(source: Path):
+    """Open any supported photo as a Pillow image (non-macOS path)."""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("Нужен Pillow: python3 -m pip install Pillow") from exc
+
+    if source.suffix.lower() in RAW_EXTENSIONS:
+        try:
+            import rawpy
+        except ImportError as exc:
+            raise RuntimeError(
+                "Для RAW вне macOS нужен rawpy: "
+                'python3 -m pip install "media-cleaner[raw]"'
+            ) from exc
+        with rawpy.imread(str(source)) as raw:
+            return Image.fromarray(raw.postprocess())
+
+    if source.suffix.lower() in {".heic", ".heif"}:
+        try:
+            import pillow_heif
+        except ImportError as exc:
+            raise RuntimeError(
+                "Для HEIC нужен pillow-heif: python3 -m pip install pillow-heif"
+            ) from exc
+        pillow_heif.register_heif_opener()
+
+    image = Image.open(source)
+    image.load()
+    return image
+
+
+def convert_photo_pillow(source: Path, temp_path: Path, target: str, quality: int) -> None:
+    """Decode with Pillow and re-encode. Fallback for non-macOS machines."""
+    if target == "heic":
+        try:
+            import pillow_heif
+        except ImportError as exc:
+            raise RuntimeError(
+                "Для записи HEIC нужен pillow-heif: python3 -m pip install pillow-heif"
+            ) from exc
+        pillow_heif.register_heif_opener()
+
+    image = load_photo_pillow(source)
+    try:
+        save_options: dict[str, object] = {"format": PHOTO_FORMATS[target]["pillow"]}
+        if not PHOTO_FORMATS[target]["lossless"]:
+            save_options["quality"] = quality
+        if target == "jpeg":
+            save_options["optimize"] = True
+        # JPEG and AVIF cannot store an alpha channel; flatten onto white rather
+        # than letting Pillow fail on an RGBA source.
+        if target in {"jpeg", "avif"} and image.mode in {"RGBA", "LA", "P"}:
+            from PIL import Image as _Image
+            converted = image.convert("RGBA")
+            flattened = _Image.new("RGB", converted.size, (255, 255, 255))
+            flattened.paste(converted, mask=converted.split()[-1])
+            image = flattened
+        elif target != "png" and image.mode not in {"RGB", "L"}:
+            image = image.convert("RGB")
+        # rawpy hands back a bare array with no metadata, so there is simply
+        # nothing to carry over on that path.
+        for key in ("exif", "icc_profile", "dpi"):
+            if key in image.info:
+                save_options[key] = image.info[key]
+        image.save(temp_path, **save_options)
+    finally:
+        image.close()
+
+
+def convert_photo(source: Path, destination: Path, target: str, level: str) -> int:
+    """Convert one photo into *destination*, returning the new size in bytes."""
+    use_sips = sips_available()
+    table = PHOTO_QUALITY_SIPS if use_sips else PHOTO_QUALITY_PILLOW
+    quality = 0 if PHOTO_FORMATS[target]["lossless"] else table[target][level]
+
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{destination.name}.", suffix=PHOTO_FORMATS[target]["suffix"],
+        dir=destination.parent, delete=False,
+    ) as temp:
+        temp_path = Path(temp.name)
+    try:
+        if use_sips:
+            convert_photo_sips(source, temp_path, target, quality)
+        else:
+            convert_photo_pillow(source, temp_path, target, quality)
+        # Keep the original capture date on the file itself, not just in EXIF.
+        shutil.copystat(source, temp_path)
+        install_temp_file(temp_path, destination)
+        return destination.stat().st_size
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def raw_decoder_available() -> bool:
+    """True when this machine can read RAW at all: sips on macOS, else rawpy."""
+    if sips_available():
+        return True
+    try:
+        import rawpy  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def photo_target_for(source: Path, chosen: str | None) -> str | None:
+    """
+    Which format this file should end up in, or None to copy it unchanged.
+
+    *chosen* is None in "keep the format" mode, where each photo is re-encoded
+    into its own format. RAW has no re-encoder, so those files are copied.
+
+    Decided BEFORE the destination is reserved, because a file that is only
+    copied has to keep its own extension instead of the target format's.
+    """
+    if source.suffix.lower() not in PHOTO_CONVERT_EXTENSIONS:
+        return None
+    # No RAW decoder on this machine: copy the file rather than failing it, so
+    # one missing optional library cannot turn a whole folder into errors.
+    if source.suffix.lower() in RAW_EXTENSIONS and not raw_decoder_available():
+        return None
+    if chosen is not None:
+        return chosen
+    return photo_format_of(source)
+
+
+def run_photo_convert_mode(
+    input_dir: Path, output_dir: Path, chosen: str | None, level: str, dry_run: bool,
+) -> int:
+    """Convert and/or compress every photo in a folder into one target format."""
+    # This mode dispatches before main()'s shared validate_paths block, so it
+    # has to report a bad input/output pair itself.
+    try:
+        input_dir, output_dir = validate_paths(input_dir, output_dir)
+    except ValueError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 2
+    files = collect_files(input_dir)
+    if not files:
+        print("В указанной папке нет файлов.")
+        return 1
+    if not dry_run:
+        try:
+            ensure_report_files_absent(output_dir, ["summary.csv", "errors.log"])
+        except FileExistsError as exc:
+            print(f"Ошибка: {exc}", file=sys.stderr)
+            return 2
+
+    counters = Counters(total=len(files))
+    summary_rows: list[dict[str, object]] = []
+    errors: list[str] = []
+    occupied: set[Path] = set()
+
+    print(f"\nРежим: {'DRY-RUN (без изменений)' if dry_run else 'конвертация фото'}")
+    print(f"Input:  {input_dir}")
+    print(f"Output: {output_dir}")
+    if not sips_available():
+        print("Кодировщик: Pillow (sips доступен только на macOS)")
+
+    photos = [path for path in files if photo_target_for(path, chosen) is not None]
+    print(f"Фотографий к обработке: {len(photos)} из {len(files)} файлов\n")
+    current = 0
+
+    for source in files:
+        target = photo_target_for(source, chosen)
+        if target is None:
+            counters.copied += 1
+            category, action = "file-copy", "copy-unchanged"
+            destination = output_dir / source.relative_to(input_dir)
+        else:
+            counters.photos += 1
+            current += 1
+            category, action = "photo", f"convert-{target}-{level}"
+            destination = (output_dir / source.relative_to(input_dir)).with_suffix(
+                PHOTO_FORMATS[target]["suffix"]
+            )
+
+        try:
+            if source.is_symlink():
+                raise RuntimeError("Символическая ссылка пропущена для безопасности")
+            original_size = source.stat().st_size
+        except (OSError, RuntimeError) as exc:
+            errors.append(f"{source}: {exc}")
+            counters.errors += 1
+            print(f"ОШИБКА: {source.relative_to(input_dir)}: {exc}")
+            continue
+
+        # Two sources can collide on one destination: DSC01635.ARW and
+        # DSC01635.JPG both want DSC01635.heic. Same handling as the archive
+        # pipeline — the second one gets a free name instead of being dropped.
+        collision_note = ""
+        if dry_run:
+            if destination in occupied:
+                destination = unique_path_for_existing_target(destination, occupied)
+                collision_note = "Имя изменено: занято другим исходным файлом этого запуска"
+            already_there = destination.exists()
+            if not already_there:
+                occupied.add(destination)
+            note = "Файл уже существует; не будет перезаписан" if already_there else ""
+            if collision_note:
+                note = f"{note}; {collision_note}" if note else collision_note
+            print(f"[{action}] {source.relative_to(input_dir)} -> {destination.relative_to(output_dir)}")
+            summary_rows.append(make_summary_row(
+                source, destination, input_dir, output_dir, category, action,
+                "would-skip-existing" if already_there else "planned",
+                original_size, "", note,
+            ))
+            continue
+
+        try:
+            if not reserve_destination(destination):
+                if destination in occupied:
+                    renamed = unique_path_for_existing_target(destination, occupied)
+                    if not reserve_destination(renamed):
+                        raise OSError(f"не удалось зарезервировать имя {renamed.name}")
+                    collision_note = "Имя изменено: занято другим исходным файлом этого запуска"
+                    destination = renamed
+                    occupied.add(destination)
+                else:
+                    # Present before this run started: not ours, left strictly alone.
+                    print(f"[skip-existing] {destination.relative_to(output_dir)}")
+                    summary_rows.append(make_summary_row(
+                        source, destination, input_dir, output_dir, category, action,
+                        "skipped", original_size, destination.stat().st_size,
+                        "Файл уже существует; пропущен без перезаписи",
+                    ))
+                    continue
+            else:
+                occupied.add(destination)
+        except OSError as exc:
+            errors.append(f"{source}: {exc}")
+            counters.errors += 1
+            print(f"ОШИБКА: {source.relative_to(input_dir)}: {exc}")
+            continue
+
+        try:
+            if target is None:
+                output_size = copy_safely(source, destination)
+                note = "Скопирован без изменений"
+            else:
+                print(
+                    f"[{current}/{len(photos)}] {source.relative_to(input_dir)} …",
+                    flush=True,
+                )
+                output_size = convert_photo(source, destination, target, level)
+                # Only sips is guaranteed to carry metadata across; rawpy hands
+                # back a bare pixel array, so promising EXIF there would be a lie.
+                note = f"Конвертировано в {target.upper()}"
+                if sips_available():
+                    note += "; EXIF сохранён"
+            counters.original_bytes += original_size
+            counters.output_bytes += output_size
+            if collision_note:
+                note = f"{note}; {collision_note}"
+            if target is not None:
+                print(
+                    f"    {format_bytes(original_size)} -> {format_bytes(output_size)}"
+                    f"  (экономия {format_bytes(original_size - output_size)})"
+                )
+            summary_rows.append(make_summary_row(
+                source, destination, input_dir, output_dir, category, action,
+                "completed", original_size, output_size, note,
+            ))
+        except Exception as exc:
+            destination.unlink(missing_ok=True)
+            counters.errors += 1
+            errors.append(f"{source}: {exc}")
+            print(f"ОШИБКА: {source.relative_to(input_dir)}: {exc}")
+            summary_rows.append(make_summary_row(
+                source, destination, input_dir, output_dir, category, action,
+                "error", original_size, "", str(exc),
+            ))
+
+    if not dry_run:
+        # Only the two reports this mode actually produces: there is no
+        # duplicate search here, so no empty duplicates_report.csv either.
+        reports_dir = output_dir / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        with (reports_dir / "summary.csv").open(
+            "x", newline="", encoding="utf-8-sig"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS)
+            writer.writeheader()
+            writer.writerows(summary_rows)
+        with (reports_dir / "errors.log").open("x", encoding="utf-8") as handle:
+            for error in errors:
+                handle.write(error + "\n")
+    print("\nИтог:")
+    print(f"  Файлов найдено: {counters.total}")
+    print(f"  Фото {'будет обработано' if dry_run else 'обработано'}: {counters.photos}")
+    print(f"  Остальных файлов скопировано: {counters.copied}")
+    print(f"  Ошибок: {counters.errors}")
+    if not dry_run:
+        print(f"  Было: {format_bytes(counters.original_bytes)}")
+        print(f"  Стало: {format_bytes(counters.output_bytes)}")
+        print(f"  Экономия: {format_bytes(counters.original_bytes - counters.output_bytes)}")
+        print(f"\nОтчёты: {output_dir / 'reports'}")
+    return 1 if counters.errors else 0
+
+
+def run_wizard_photo_convert(args: argparse.Namespace) -> argparse.Namespace | None:
+    """Wizard branch: convert and/or compress a folder of photos."""
+    input_dir = prompt_input_directory()
+    output_dir = prompt_output_directory(input_dir, "converted")
+
+    print("\nФормат:")
+    print("  1. Не менять формат")
+    print("  2. Поменять формат")
+    if prompt_menu("Выберите 1-2 [Enter = 2]: ", {"1", "2"}, "2") == "1":
+        chosen = None
+    else:
+        print("\nНа какой формат менять:")
+        keys = list(PHOTO_FORMATS)
+        for index, key in enumerate(keys, start=1):
+            print(f"  {index}. {key.upper():5} — {PHOTO_FORMATS[key]['advice']}")
+        choice = prompt_menu(
+            f"Выберите 1-{len(keys)} [Enter = 1, {keys[0].upper()}]: ",
+            {str(i) for i in range(1, len(keys) + 1)}, "1",
+        )
+        chosen = keys[int(choice) - 1]
+
+    print("\nСжимать?")
+    print("  1. Не сжимать (максимальное качество)")
+    print("  2. Сжимать")
+    if prompt_menu("Выберите 1-2 [Enter = 1]: ", {"1", "2"}, "1") == "1":
+        level = "none"
+    else:
+        print("\nНасколько сильно:")
+        print("  1. Осторожно")
+        print("  2. Нормально")
+        print("  3. Сильно")
+        level = {"1": "light", "2": "normal", "3": "strong"}[
+            prompt_menu("Выберите 1-3 [Enter = 2]: ", {"1", "2", "3"}, "2")
+        ]
+
+    # Keeping the format AND not compressing is a plain copy. Say so instead of
+    # letting the user sit through a run that changes nothing.
+    if chosen is None and level == "none":
+        print(
+            "\nФормат не меняется и сжатие выключено — файлы будут просто скопированы "
+            "без изменений.\nВыберите формат или включите сжатие, чтобы что-то произошло."
+        )
+        return None
+    if chosen == "png" and level != "none":
+        print("\nПримечание: PNG сжимается без потерь, уровень сжатия на него не влияет.")
+
+    print("\nИтоговые настройки:")
+    print(f"  Input: {input_dir}")
+    print(f"  Output: {output_dir}")
+    print(f"  Формат: {'не меняется' if chosen is None else chosen.upper()}")
+    print(f"  Сжатие: {PHOTO_LEVEL_LABELS[level]}")
+    if not sips_available():
+        print("  Кодировщик: Pillow (sips доступен только на macOS)")
+        print("  Для RAW-файлов понадобится rawpy")
+    print("  Оригиналы не изменяются и не удаляются")
+    if input("\nНапишите YES, чтобы начать: ").strip() != "YES":
+        print("Запуск отменён. Ничего не изменено.")
+        return None
+
+    args.input = input_dir
+    args.output = output_dir
+    args.convert_photos = True
+    args.photo_format = chosen if chosen is not None else "keep"
+    args.photo_level = level
+    return args
+
+
 def main() -> int:
     args = parse_args()
     if getattr(args, "list_encoders", False):
@@ -5527,6 +6023,12 @@ def main() -> int:
             disable_hw=args.disable_hw_video,
             video_codec=args.video_codec,
             video_qp=args.video_qp,
+        )
+    if getattr(args, "convert_photos", False):
+        return run_photo_convert_mode(
+            args.input, args.output,
+            None if args.photo_format == "keep" else args.photo_format,
+            args.photo_level, args.dry_run,
         )
     if args.review_duplicates:
         return run_review_duplicates_mode(args.input, args.output)

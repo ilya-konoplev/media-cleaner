@@ -27,6 +27,9 @@ dependencies = [
 [project.optional-dependencies]
 # HEIC support. Kept optional so a missing wheel can never break the main install.
 heic = ["pillow-heif"]
+# RAW decoding for photo conversion on Windows and Linux. macOS needs nothing:
+# the built-in sips reads every RAW format already.
+raw = ["rawpy"]
 
 [project.urls]
 Homepage = "https://github.com/ilya-konoplev/media-cleaner"
