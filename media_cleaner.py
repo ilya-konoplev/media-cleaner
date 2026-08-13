@@ -6547,14 +6547,46 @@ def _run_cli() -> int:
             ))
         except Exception as exc:
             destination.unlink(missing_ok=True)
-            counters.errors += 1
-            message = f"{source}: {exc}"
-            errors.append(message)
-            print(f"ОШИБКА: {message}")
-            error_note = f"{exc}; {collision_note}" if collision_note else str(exc)
+            # A file we cannot re-encode still belongs in the new archive. Left
+            # out, it is simply missing from the folder the user is told to
+            # treat as their new archive — and if they then delete the
+            # originals, it is gone for real. Truncated JPEGs, empty files and
+            # files whose extension lies about their contents all land here.
+            rescue = destination
+            if destination.suffix.lower() != source.suffix.lower():
+                # Video destinations were renamed to .mp4; an un-encoded copy
+                # must keep its real container instead of lying about format.
+                rescue = destination.with_suffix(source.suffix)
+                if rescue in occupied or not reserve_destination(rescue):
+                    rescue = unique_path_for_existing_target(rescue, occupied)
+                    reserve_destination(rescue)
+                occupied.add(rescue)
+            try:
+                output_size = copy_safely(source, rescue)
+            except Exception as copy_exc:
+                rescue.unlink(missing_ok=True)
+                errors.append(f"{source}: {exc}; копия тоже не удалась: {copy_exc}")
+                print(f"ОШИБКА: {source.relative_to(input_dir)}: {exc}")
+                summary_rows.append(make_summary_row(
+                    source, destination, input_dir, output_dir, category, action,
+                    "error", original_size, "",
+                    f"{exc}; {collision_note}" if collision_note else str(exc),
+                ))
+                continue
+            counters.original_bytes += original_size
+            counters.output_bytes += output_size
+            errors.append(f"{source}: не удалось пережать ({exc}); скопирован без изменений")
+            print(
+                f"[скопирован без изменений] {source.relative_to(input_dir)} — "
+                f"не удалось пережать: {exc}"
+            )
+            note = f"Не удалось пережать ({exc}); файл скопирован без изменений"
+            if collision_note:
+                note = f"{note}; {collision_note}"
             summary_rows.append(make_summary_row(
-                source, destination, input_dir, output_dir, category, action,
-                "error", original_size, "", error_note,
+                source, rescue, input_dir, output_dir, category,
+                "copy-after-failed-compression", "completed-as-copy",
+                original_size, output_size, note,
             ))
 
     counters.errors = len(errors)
