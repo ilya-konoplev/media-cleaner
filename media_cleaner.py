@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -844,7 +845,62 @@ def add_numeric_suffix(path: Path, number: int) -> Path:
     return path.with_name(f"{stem}_{number}{suffix}")
 
 
-def unique_path_for_existing_target(base_path: Path, occupied: set[Path] | None = None) -> Path:
+def filesystem_folds_case(directory: Path) -> bool:
+    """
+    Whether *directory* treats names differing only in case as the same file.
+
+    Probed for real instead of guessed from the platform: an external ext4 or a
+    case-sensitive APFS volume plugged into a Mac behaves differently from the
+    boot disk. On any failure we answer True, because that is the safe
+    direction — assuming folding costs at most one needless rename, while
+    wrongly assuming otherwise silently drops a file.
+    """
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix=".mc-case-probe-", suffix="A", dir=directory
+        ) as probe:
+            return Path(probe.name[:-1] + "a").exists()
+    except OSError:
+        return True
+
+
+class DestinationRegistry:
+    """
+    The set of output paths already claimed by this run, compared the way the
+    filesystem itself compares names.
+
+    A plain set of Path compares exactly, but APFS and NTFS fold case and APFS
+    also ignores Unicode normalization — there, Vid.mp4 and vid.mp4 are ONE
+    file. Since destination_for() rewrites every video suffix to .mp4, a folder
+    holding Vid.MOV and vid.mp4 produced two destinations the code believed
+    were distinct; the second reservation then failed, was read as "this file
+    was here before us", and the video vanished from the output with a cheerful
+    "Ошибок: 0". Matching the filesystem's own notion of sameness turns that
+    back into the ordinary collision the renaming path already handles.
+    """
+
+    def __init__(self, fold_case: bool) -> None:
+        self._fold_case = fold_case
+        self._keys: set[str] = set()
+
+    def _key(self, path: Path) -> str:
+        text = unicodedata.normalize("NFC", str(path))
+        return text.casefold() if self._fold_case else text
+
+    def add(self, path: Path) -> None:
+        self._keys.add(self._key(path))
+
+    def __contains__(self, path: object) -> bool:
+        return isinstance(path, Path) and self._key(path) in self._keys
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+
+def unique_path_for_existing_target(
+    base_path: Path, occupied: "set[Path] | DestinationRegistry | None" = None
+) -> Path:
     if occupied is None:
         occupied = set()
     candidate = base_path
@@ -1017,8 +1073,8 @@ def run_move_duplicates_mode(
     moved_rows: list[dict[str, object]] = []
     moved_bytes = 0
     errors = list(duplicate_errors)
-    occupied_targets: set[Path] = set()
     cleanup_root = output_dir / "Duplicates_To_Delete"
+    occupied_targets = DestinationRegistry(filesystem_folds_case(output_dir))
 
     for group in duplicate_groups:
         first_copy = True
@@ -5763,7 +5819,7 @@ def run_photo_convert_mode(
     counters = Counters(total=len(files))
     summary_rows: list[dict[str, object]] = []
     errors: list[str] = []
-    occupied: set[Path] = set()
+    occupied = DestinationRegistry(filesystem_folds_case(output_dir))
 
     print(f"\nРежим: {'DRY-RUN (без изменений)' if dry_run else 'конвертация фото'}")
     print(f"Input:  {input_dir}")
@@ -6261,7 +6317,7 @@ def _run_cli() -> int:
     # Destinations claimed by THIS run. Needed because destination_for() rewrites
     # every video suffix to .mp4, so Ep01.mkv and Ep01.mp4 collide on Ep01.mp4.
     # Kept in sync between the dry-run plan and the real run.
-    occupied: set[Path] = set()
+    occupied = DestinationRegistry(filesystem_folds_case(output_dir))
 
     print(f"Режим: {'DRY-RUN (без изменений)' if args.dry_run else 'обработка'}")
     print(f"Input:  {input_dir}")
