@@ -20,3 +20,6 @@ reports/
 build/
 dist/
 *.egg-info/
+
+# Рабочие копии фоновых агентов
+.claude/
