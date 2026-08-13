@@ -3669,16 +3669,20 @@ def _read_capture_timestamp_pillow(path: Path) -> float | None:
 def read_capture_timestamp(path: Path) -> float | None:
     """
     Best-effort capture date (EXIF DateTimeOriginal, falling back to
-    CreateDate) as a POSIX timestamp. Tries exiftool first, since it also
-    handles RAW formats Pillow cannot decode, then falls back to Pillow so
-    this still works with no extra tooling installed. Returns None on any
-    failure — missing tags, unreadable file, garbage date — and callers must
-    treat None as "we don't know, leave dates alone."
+    CreateDate) as a POSIX timestamp. Returns None on any failure — missing
+    tags, unreadable file, garbage date — and callers must treat None as
+    "we don't know, leave dates alone."
+
+    Pillow goes first because it reads the header in-process; exiftool is a
+    subprocess costing ~26 ms, which is real money when it runs once per photo.
+    exiftool is still the fallback, and it is what actually answers for RAW,
+    which Pillow cannot open at all — there the cost disappears next to a
+    ~700 ms demosaic anyway.
     """
-    timestamp = _read_capture_timestamp_exiftool(path)
+    timestamp = _read_capture_timestamp_pillow(path)
     if timestamp is not None:
         return timestamp
-    return _read_capture_timestamp_pillow(path)
+    return _read_capture_timestamp_exiftool(path)
 
 
 def apply_capture_date(source: Path, result_path: Path) -> None:
@@ -3704,6 +3708,36 @@ def apply_capture_date(source: Path, result_path: Path) -> None:
         pass
 
 
+def _has_usercomment(source: Path) -> bool:
+    """
+    Whether *source* carries a UserComment worth repairing after sips.
+
+    Deliberately does NOT try to decide whether the value is non-ASCII. EXIF
+    stores UserComment behind an 8-byte charset marker, and a UTF-16 payload
+    encodes Cyrillic as 0x04xx — every byte below 0x80, so a byte-level
+    "is it ASCII" test reports plain ASCII and silently skips the repair.
+    Getting that wrong loses data; getting it merely imprecise costs one
+    subprocess on the rare photo that has any comment at all. Almost none do,
+    which is where the saving comes from.
+
+    Pillow only parses the header here, so this is milliseconds against the
+    subprocess it guards. When Pillow cannot open the file (RAW), answer True
+    and let exiftool decide — a RAW conversion is slow enough to hide it.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(source) as image:
+            # UserComment (0x9286) lives in the Exif sub-IFD (0x8769).
+            comment = image.getexif().get_ifd(0x8769).get(0x9286)
+    except Exception:  # noqa: BLE001 — unreadable header, RAW, no Pillow.
+        return True
+    if not comment:
+        return False
+    payload = comment[8:] if isinstance(comment, bytes) else str(comment)
+    return bool(payload) and payload not in (b"", "")
+
+
 def restore_usercomment_with_exiftool(source: Path, result_path: Path) -> None:
     """
     sips corrupts a non-ASCII EXIF UserComment when it re-encodes a photo: it
@@ -3717,6 +3751,11 @@ def restore_usercomment_with_exiftool(source: Path, result_path: Path) -> None:
     """
     binary = _exiftool_binary()
     if binary is None:
+        return
+    # Skip the subprocess unless the source really carries a value sips could
+    # mangle. Almost no photo has a non-ASCII UserComment, and paying ~26 ms
+    # per file to repair a field that is usually absent is a bad trade.
+    if not _has_usercomment(source):
         return
     try:
         subprocess.run(
