@@ -3679,10 +3679,45 @@ def read_capture_timestamp(path: Path) -> float | None:
     which Pillow cannot open at all — there the cost disappears next to a
     ~700 ms demosaic anyway.
     """
+    if path.suffix.lower() in VIDEO_EXTENSIONS:
+        return _read_capture_timestamp_video(path)
     timestamp = _read_capture_timestamp_pillow(path)
     if timestamp is not None:
         return timestamp
     return _read_capture_timestamp_exiftool(path)
+
+
+def _read_capture_timestamp_video(path: Path) -> float | None:
+    """
+    Shooting date of a video, from the container's creation_time tag.
+
+    Unlike EXIF, this tag is UTC (ISO 8601, usually with a trailing Z), so it
+    is parsed as such and converted — treating it as local time would shift
+    every clip by the timezone offset. Cameras that write no creation_time,
+    or write a placeholder epoch, simply yield None.
+    """
+    if shutil.which("ffprobe") is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format_tags=creation_time",
+             "-of", "default=nk=1:nw=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    stamp = parsed.timestamp()
+    # 1971 guards against the 1904/1970 placeholders some muxers emit.
+    return stamp if stamp > 31_536_000 else None
 
 
 def apply_capture_date(source: Path, result_path: Path) -> None:
@@ -5133,6 +5168,9 @@ def compress_movie_with_stream_selection(
             stderr = result.stderr.strip() if result.stderr else ""
             raise RuntimeError(stderr or f"ffmpeg завершился с кодом {result.returncode}")
         shutil.copystat(source, temp_path)
+        # Same reasoning as for photos: the source mtime is usually the day the
+        # file was copied onto this machine, not the day it was shot.
+        apply_capture_date(source, temp_path)
         install_temp_file(temp_path, destination)
         if video_mode == "copy":
             note = "Фильм пересобран в MKV без сжатия видео"
@@ -5784,8 +5822,10 @@ def compress_video(
         if compressed_size >= original_size and fallback_to_original:
             temp_path.unlink(missing_ok=True)
             output_size = copy_safely(source, destination)
+            apply_capture_date(source, destination)
             return output_size, "Сжатая версия была больше оригинала; скопирован оригинал"
         shutil.copystat(source, temp_path)
+        apply_capture_date(source, temp_path)
         install_temp_file(temp_path, destination)
         if compressed_size >= original_size:
             return compressed_size, "Сжатый файл больше оригинала; оригинал не изменён"
@@ -6804,7 +6844,9 @@ def _run_cli() -> int:
                 # Still lands in output, just byte-for-byte instead of re-encoded.
                 output_size = copy_safely(source, destination)
                 note = skip_note
-                if category == "jpeg":
+                # Video belongs here too: a clip skipped as already-efficient is
+                # copied, and deserves its shooting date like any other file.
+                if category in {"jpeg", "video"}:
                     apply_capture_date(source, destination)
             elif category == "video":
                 print(
@@ -6867,6 +6909,7 @@ def _run_cli() -> int:
                 occupied.add(rescue)
             try:
                 output_size = copy_safely(source, rescue)
+                apply_capture_date(source, rescue)
             except Exception as copy_exc:
                 rescue.unlink(missing_ok=True)
                 errors.append(f"{source}: {exc}; копия тоже не удалась: {copy_exc}")
