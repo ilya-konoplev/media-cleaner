@@ -6058,6 +6058,30 @@ def run_wizard_photo_convert(args: argparse.Namespace) -> argparse.Namespace | N
 
 
 def main() -> int:
+    """
+    Entry point, and the only place interrupts are turned into plain Russian.
+
+    Wraps _run_cli rather than the __main__ block below, because the installed
+    `mc` command calls main() directly and never executes that block — guarding
+    only there would leave every real user with the traceback.
+    """
+    try:
+        return _run_cli()
+    except KeyboardInterrupt:
+        # Modes that can say something more specific (which files were finished,
+        # how to resume) catch this themselves and never reach here.
+        print(
+            "\n\nОстановлено. Оригиналы не тронуты — программа никогда их не меняет.",
+            file=sys.stderr,
+        )
+        return 130
+    except EOFError:
+        # Ctrl+D, or stdin ran out because the program was run from a script.
+        print("\nВвод закончился, запуск отменён. Ничего не изменено.", file=sys.stderr)
+        return 130
+
+
+def _run_cli() -> int:
     args = parse_args()
     if getattr(args, "list_encoders", False):
         return print_encoder_table(force_refresh=args.refresh_hw_cache)
