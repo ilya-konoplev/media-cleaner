@@ -3433,6 +3433,150 @@ def install_temp_file(temp_path: Path, destination: Path) -> None:
     os.replace(temp_path, destination)
 
 
+def _parse_exif_datetime(value: str) -> float | None:
+    """
+    Parse an EXIF-style "YYYY:MM:DD HH:MM:SS" timestamp as LOCAL time (that is
+    what cameras write, with no timezone attached — see read_capture_timestamp).
+
+    Returns a POSIX timestamp, or None for anything that is not a clean,
+    plausible date: wrong shape, "0000:00:00 00:00:00" placeholders, dates so
+    far out of range that timestamp() cannot represent them, etc.
+    """
+    value = value.strip()[:19]
+    try:
+        dt = datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+        return dt.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+# Cached lazily: shutil.which() touches the filesystem, and this file's other
+# probes (ffmpeg encoders, sips) use the same one-shot-cache pattern.
+_EXIFTOOL_BINARY_CACHE: dict[str, str | None] = {}
+
+
+def _exiftool_binary() -> str | None:
+    if "path" not in _EXIFTOOL_BINARY_CACHE:
+        _EXIFTOOL_BINARY_CACHE["path"] = shutil.which("exiftool")
+    return _EXIFTOOL_BINARY_CACHE["path"]
+
+
+def _read_capture_timestamp_exiftool(path: Path) -> float | None:
+    """Ask exiftool for DateTimeOriginal/CreateDate. None if exiftool is
+    absent or fails for any reason — it is an optional tool, never a hard
+    dependency."""
+    binary = _exiftool_binary()
+    if binary is None:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "-s3", "-DateTimeOriginal", "-CreateDate", str(path)],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:  # noqa: BLE001 — exiftool is optional, never fatal.
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        timestamp = _parse_exif_datetime(line)
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def _read_capture_timestamp_pillow(path: Path) -> float | None:
+    """Ask Pillow's EXIF reader for DateTimeOriginal/CreateDate. Works for
+    formats Pillow can open (JPEG, TIFF, HEIC with pillow-heif, ...); RAW
+    formats it cannot decode simply yield None here, same as any other
+    failure."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        with Image.open(path) as image:
+            exif = image.getexif()
+            if not exif:
+                return None
+            # DateTimeOriginal/CreateDate live in the EXIF sub-IFD (0x8769),
+            # not the top-level IFD0 that getexif() returns directly.
+            exif_ifd = exif.get_ifd(0x8769)
+    except Exception:  # noqa: BLE001 — any decode failure just means "unknown".
+        return None
+    for tag_id in (36867, 36868):  # DateTimeOriginal, CreateDate
+        value = exif_ifd.get(tag_id) if exif_ifd else None
+        if not value:
+            continue
+        timestamp = _parse_exif_datetime(str(value))
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def read_capture_timestamp(path: Path) -> float | None:
+    """
+    Best-effort capture date (EXIF DateTimeOriginal, falling back to
+    CreateDate) as a POSIX timestamp. Tries exiftool first, since it also
+    handles RAW formats Pillow cannot decode, then falls back to Pillow so
+    this still works with no extra tooling installed. Returns None on any
+    failure — missing tags, unreadable file, garbage date — and callers must
+    treat None as "we don't know, leave dates alone."
+    """
+    timestamp = _read_capture_timestamp_exiftool(path)
+    if timestamp is not None:
+        return timestamp
+    return _read_capture_timestamp_pillow(path)
+
+
+def apply_capture_date(source: Path, result_path: Path) -> None:
+    """
+    If *source* has a readable EXIF capture date, stamp *result_path*'s mtime
+    with it instead of leaving whatever copystat/copy2 already put there
+    (normally the copy-time mtime of the source, i.e. "today" for files just
+    pulled off a camera or another machine).
+
+    On APFS, setting mtime into the past also pulls the file's creation date
+    (birthtime) along with it, so Finder ends up showing the real capture
+    date without any separate birthtime call.
+
+    Best-effort and silent: any failure here (unreadable EXIF, no PIL/exiftool,
+    permission error) simply leaves the file's date exactly as it already was.
+    """
+    try:
+        timestamp = read_capture_timestamp(source)
+        if timestamp is None:
+            return
+        os.utime(result_path, (timestamp, timestamp))
+    except Exception:  # noqa: BLE001 — dates are a nicety, never worth failing a file over.
+        pass
+
+
+def restore_usercomment_with_exiftool(source: Path, result_path: Path) -> None:
+    """
+    sips corrupts a non-ASCII EXIF UserComment when it re-encodes a photo: it
+    appears to truncate by character count while the underlying value is
+    UTF-8 bytes, slicing a multi-byte character in half (observed: the
+    Cyrillic "заметка" comes out as "зам"). If exiftool is available, copy
+    the original value back onto the converted file afterwards.
+
+    Best-effort and silent: no exiftool installed, no UserComment on the
+    source, or any other failure just leaves sips' result exactly as it was.
+    """
+    binary = _exiftool_binary()
+    if binary is None:
+        return
+    try:
+        subprocess.run(
+            [binary, "-overwrite_original", "-TagsFromFile", str(source),
+             "-UserComment", str(result_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:  # noqa: BLE001 — exiftool is optional, never fatal.
+        pass
+
+
 def copy_safely(source: Path, destination: Path) -> int:
     with tempfile.NamedTemporaryFile(
         prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent, delete=False
@@ -3466,6 +3610,9 @@ def compress_jpeg(source: Path, destination: Path, quality: int) -> int:
                     save_options[key] = image.info[key]
             image.save(temp_path, **save_options)
         shutil.copystat(source, temp_path)
+        # Prefer the real capture date over the copystat'd mtime, when we can
+        # read one — see apply_capture_date's docstring.
+        apply_capture_date(source, temp_path)
         install_temp_file(temp_path, destination)
         return destination.stat().st_size
     finally:
@@ -5721,10 +5868,14 @@ def convert_photo(source: Path, destination: Path, target: str, level: str) -> i
     try:
         if use_sips:
             convert_photo_sips(source, temp_path, target, quality)
+            # Works around a sips bug that mangles non-ASCII UserComment values.
+            restore_usercomment_with_exiftool(source, temp_path)
         else:
             convert_photo_pillow(source, temp_path, target, quality)
-        # Keep the original capture date on the file itself, not just in EXIF.
+        # Start from the source's mtime (usually copy time, not capture time)...
         shutil.copystat(source, temp_path)
+        # ...then override it with the real capture date when EXIF has one.
+        apply_capture_date(source, temp_path)
         install_temp_file(temp_path, destination)
         return destination.stat().st_size
     finally:
@@ -5931,6 +6082,11 @@ def run_photo_convert_mode(
             if target is None:
                 output_size = copy_safely(source, destination)
                 note = "Скопирован без изменений"
+                # target is None either for a non-photo file, or a RAW file this
+                # machine cannot decode (no rawpy) — in the RAW case we still
+                # want the real capture date instead of today's copy date.
+                if source.suffix.lower() in PHOTO_CONVERT_EXTENSIONS:
+                    apply_capture_date(source, destination)
             else:
                 output_size = convert_photo(source, destination, target, level)
                 # Only sips is guaranteed to carry metadata across; rawpy hands
@@ -6443,6 +6599,8 @@ def _run_cli() -> int:
                 # Still lands in output, just byte-for-byte instead of re-encoded.
                 output_size = copy_safely(source, destination)
                 note = skip_note
+                if category == "jpeg":
+                    apply_capture_date(source, destination)
             elif category == "video":
                 print(
                     f"[video {current_video}/{total_videos}] "
@@ -6460,6 +6618,8 @@ def _run_cli() -> int:
             else:
                 output_size = copy_safely(source, destination)
                 note = "Скопирован без изменений"
+                if category in {"image-copy", "raw-copy"}:
+                    apply_capture_date(source, destination)
             counters.original_bytes += original_size
             counters.output_bytes += output_size
             if skip_note:
