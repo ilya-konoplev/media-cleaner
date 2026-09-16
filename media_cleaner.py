@@ -3689,35 +3689,47 @@ def read_capture_timestamp(path: Path) -> float | None:
 
 def _read_capture_timestamp_video(path: Path) -> float | None:
     """
-    Shooting date of a video, from the container's creation_time tag.
+    Shooting date of a video.
 
-    Unlike EXIF, this tag is UTC (ISO 8601, usually with a trailing Z), so it
-    is parsed as such and converted — treating it as local time would shift
-    every clip by the timezone offset. Cameras that write no creation_time,
-    or write a placeholder epoch, simply yield None.
+    Apple's com.apple.quicktime.creationdate comes first: it is the moment
+    the clip was shot, with its timezone attached. The container's
+    creation_time is only a fallback, because iOS rewrites it whenever the
+    clip is trimmed, exported or sent (AirDrop, messengers) — measured on real
+    iPhone clips it ran 3.5-5 hours past the actual shot, which is exactly how
+    an evening export turned a morning clip into "night" and vice versa.
+
+    creation_time is UTC (ISO 8601, usually with a trailing Z), so it is
+    parsed as such — treating it as local time would shift every clip by the
+    timezone offset. Cameras that write neither, or write a placeholder
+    epoch, simply yield None.
     """
     if shutil.which("ffprobe") is None:
         return None
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries", "format_tags=creation_time",
-             "-of", "default=nk=1:nw=1", str(path)],
+            ["ffprobe", "-v", "quiet", "-show_entries",
+             "format_tags=com.apple.quicktime.creationdate,creation_time",
+             "-of", "json", str(path)],
             capture_output=True, text=True, timeout=30,
         )
-    except (OSError, subprocess.SubprocessError):
+        tags = json.loads(result.stdout or "{}").get("format", {}).get("tags", {})
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None
-    raw = (result.stdout or "").strip()
-    if not raw:
-        return None
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    stamp = parsed.timestamp()
-    # 1971 guards against the 1904/1970 placeholders some muxers emit.
-    return stamp if stamp > 31_536_000 else None
+    for key in ("com.apple.quicktime.creationdate", "creation_time"):
+        raw = str(tags.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        stamp = parsed.timestamp()
+        # 1971 guards against the 1904/1970 placeholders some muxers emit.
+        if stamp > 31_536_000:
+            return stamp
+    return None
 
 
 def apply_capture_date(source: Path, result_path: Path) -> None:
@@ -6330,7 +6342,9 @@ def run_photo_convert_mode(
                 # target is None either for a non-photo file, or a RAW file this
                 # machine cannot decode (no rawpy) — in the RAW case we still
                 # want the real capture date instead of today's copy date.
-                if source.suffix.lower() in PHOTO_CONVERT_EXTENSIONS:
+                # Video passes through here too and needs its shooting date just
+                # the same, or a clip ends up dated the evening the run happened.
+                if source.suffix.lower() in PHOTO_CONVERT_EXTENSIONS | VIDEO_EXTENSIONS:
                     apply_capture_date(source, destination)
             else:
                 output_size = convert_photo(source, destination, target, level)
