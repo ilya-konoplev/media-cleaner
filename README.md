@@ -58,11 +58,13 @@ python3 --version
 
 Если команда не найдена, скачайте Python с [python.org](https://www.python.org/downloads/macos/) и установите. Затем закройте и снова откройте Terminal.
 
-**2. ffmpeg.** Проще всего через [Homebrew](https://brew.sh/):
+**2. ffmpeg и exiftool.** Проще всего через [Homebrew](https://brew.sh/):
 
 ```bash
-brew install ffmpeg
+brew install ffmpeg exiftool
 ```
+
+ffmpeg нужен для всего, что связано с видео. exiftool нужен, чтобы у RAW-файлов сохранялась дата съёмки.
 
 **3. Сам Media Cleaner.** Рекомендуется через [pipx](https://pipx.pypa.io/) — он ставит программу в изолированное окружение, но команда работает из любой папки:
 
@@ -96,10 +98,11 @@ mc
 python --version
 ```
 
-**2. ffmpeg.** Через встроенный менеджер пакетов:
+**2. ffmpeg и exiftool.** Через встроенный менеджер пакетов:
 
 ```powershell
 winget install Gyan.FFmpeg
+winget install OliverBetz.ExifTool
 ```
 
 Затем закройте и снова откройте PowerShell и проверьте:
