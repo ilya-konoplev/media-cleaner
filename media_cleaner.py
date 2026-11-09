@@ -446,55 +446,54 @@ def prompt_yes_no(prompt: str, default: str | None = None) -> bool:
 def run_wizard(args: argparse.Namespace) -> argparse.Namespace | None:
     print("\nMedia Cleaner: пошаговый безопасный запуск\n")
     print("Что сделать?")
-    print("  1. Только найти дубликаты")
-    print("  2. Dry-run сжатия")
-    print("  3. Реальное сжатие")
-    print("  4. Быстро сжать один видеофайл")
-    print("  5. Безопасно убрать лишние дубликаты")
-    print("  6. Просмотреть точные дубликаты удобно")
-    print("  7. Найти визуально похожие фото")
-    print("  8. Удалить похожие фото из отчёта в корзину")
-    print("  9. Найти визуально похожие видео")
-    print(" 10. Удалить похожие видео из отчёта в корзину")
-    print(" 11. Пересобрать фильмы/сериалы в MKV: выбор дорожек, со сжатием или без")
-    print(" 12. Сжатие/конвертация фото (в том числе RAW: .arw, .cr2, .nef)")
-    print(" 13. Выйти")
-    mode = prompt_menu(
-        "Выберите 1-13: ",
-        {"1","2","3","4","5","6","7","8","9","10","11","12","13"},
-    )
-    if mode == "13":
+    print("  1. Сжать видео и фото (файл или папку)")
+    print("  2. Точные дубликаты: найти и посмотреть / убрать лишние копии")
+    print("  3. Похожие фото: найти / удалить выбранные в корзину")
+    print("  4. Похожие видео: найти / удалить выбранные в корзину")
+    print("  5. Пересобрать фильмы/сериалы в MKV: выбор дорожек, со сжатием или без")
+    print("  6. Сжатие/конвертация фото (в том числе RAW: .arw, .cr2, .nef)")
+    print("  7. Выйти")
+    choice = prompt_menu("Выберите 1-7: ", set("1234567"))
+    if choice == "7":
         print("Запуск отменён.")
         return None
-
-    if mode == "4":
-        return run_wizard_quick_file(args)
-    if mode == "5":
-        return run_wizard_move_duplicates(args)
-    if mode == "6":
-        return run_wizard_review_duplicates(args)
-    if mode == "7":
-        return run_wizard_similar_photos(args)
-    if mode == "8":
-        return run_wizard_trash_similar(args)
-    if mode == "9":
-        return run_wizard_similar_videos(args)
-    if mode == "10":
-        return run_wizard_trash_similar_videos(args)
-    if mode == "11":
+    if choice == "2":
+        print("\nТочные дубликаты:")
+        print("  1. Найти и посмотреть (только отчёт, файлы не трогаются)")
+        print("  2. Безопасно убрать лишние копии (одна копия всегда остаётся)")
+        sub = prompt_menu("Выберите 1-2 [Enter = 1]: ", {"1", "2"}, "1")
+        return run_wizard_review_duplicates(args) if sub == "1" else run_wizard_move_duplicates(args)
+    if choice in {"3", "4"}:
+        kind = "фото" if choice == "3" else "видео"
+        print(f"\nПохожие {kind}:")
+        print("  1. Найти (отчёт для ручной проверки, файлы не трогаются)")
+        print("  2. Удалить выбранные из готового отчёта в корзину")
+        sub = prompt_menu("Выберите 1-2 [Enter = 1]: ", {"1", "2"}, "1")
+        if choice == "3":
+            return run_wizard_similar_photos(args) if sub == "1" else run_wizard_trash_similar(args)
+        return run_wizard_similar_videos(args) if sub == "1" else run_wizard_trash_similar_videos(args)
+    if choice == "5":
         return run_wizard_movie_mkv(args)
-    if mode == "12":
+    if choice == "6":
         return run_wizard_photo_convert(args)
 
+    # choice == "1": one file goes to the quick single-video path, a folder to
+    # the batch path below.
     while True:
-        input_value = input("\nВставьте или перетащите input-папку в Terminal: ")
-        if not input_value.strip():
-            print("Укажите путь к input-папке.")
+        target_value = input("\nВставьте или перетащите видеофайл или папку в Terminal: ")
+        if not target_value.strip():
+            print("Укажите путь к файлу или папке.")
             continue
-        input_dir = clean_terminal_path(input_value).resolve()
-        if input_dir.is_dir():
+        target = clean_terminal_path(target_value).resolve()
+        if target.is_file() and not target.is_symlink():
+            return run_wizard_quick_file(args, source=target)
+        if target.is_dir():
+            input_dir = target
             break
-        print(f"Папка не найдена: {input_dir}")
+        print(f"Не найдено: {target}")
+    dry_run = prompt_yes_no(
+        "Сначала пробный прогон (только план, ничего не записывать)? yes/no [no]: ", "no"
+    )
 
     suggested_output = input_dir.parent / f"{input_dir.name} compressed"
     while True:
@@ -512,100 +511,85 @@ def run_wizard(args: argparse.Namespace) -> argparse.Namespace | None:
             continue
         break
 
-    mode_name = {
-        "1": "только поиск дубликатов",
-        "2": "dry-run сжатия",
-        "3": "реальное сжатие",
-    }[mode]
+    mode_name = "пробный прогон сжатия" if dry_run else "сжатие"
 
-    if mode == "1":
-        video_crf = args.video_crf
-        image_quality = args.image_quality
-        video_preset = args.video_preset
-        show_progress = False
+    show_progress = prompt_yes_no("Показывать подробный прогресс ffmpeg? yes/no [no]: ", "no")
+    print("\nКачество:")
+    print("  1. Осторожно: video_crf=28, image_quality=90")
+    print("  2. Нормально: video_crf=30, image_quality=85")
+    print("  3. Сильно: video_crf=31, image_quality=85")
+    print("  4. Очень сильно: video_crf=32, image_quality=80")
+    print("  5. Ввести вручную")
+    quality_choice = prompt_menu("Выберите 1-5 [Enter = 3]: ", set("12345"), "3")
+    quality_presets = {
+        "1": (28, 90), "2": (30, 85), "3": (31, 85), "4": (32, 80),
+    }
+    if quality_choice == "5":
+        video_crf = prompt_number("Video CRF (18-35): ", 18, 35)
+        image_quality = prompt_number("Качество JPEG (1-100): ", 1, 100)
     else:
-        show_progress = prompt_yes_no("Показывать подробный прогресс ffmpeg? yes/no [no]: ", "no")
-        print("\nКачество:")
-        print("  1. Осторожно: video_crf=28, image_quality=90")
-        print("  2. Нормально: video_crf=30, image_quality=85")
-        print("  3. Сильно: video_crf=31, image_quality=85")
-        print("  4. Очень сильно: video_crf=32, image_quality=80")
-        print("  5. Ввести вручную")
-        quality_choice = prompt_menu("Выберите 1-5 [Enter = 3]: ", set("12345"), "3")
-        quality_presets = {
-            "1": (28, 90), "2": (30, 85), "3": (31, 85), "4": (32, 80),
-        }
-        if quality_choice == "5":
-            video_crf = prompt_number("Video CRF (18-35): ", 18, 35)
-            image_quality = prompt_number("Качество JPEG (1-100): ", 1, 100)
-        else:
-            video_crf, image_quality = quality_presets[quality_choice]
+        video_crf, image_quality = quality_presets[quality_choice]
 
-        print("\nСкорость сжатия видео:")
-        print("  1. fast (по умолчанию)")
-        print("  2. medium")
-        print("  3. slow")
-        print("  4. faster")
-        preset_choice = prompt_menu("Выберите 1-4 [Enter = 1]: ", set("1234"), "1")
-        video_preset = {"1": "fast", "2": "medium", "3": "slow", "4": "faster"}[preset_choice]
+    print("\nСкорость сжатия видео:")
+    print("  1. fast (по умолчанию)")
+    print("  2. medium")
+    print("  3. slow")
+    print("  4. faster")
+    preset_choice = prompt_menu("Выберите 1-4 [Enter = 1]: ", set("1234"), "1")
+    video_preset = {"1": "fast", "2": "medium", "3": "slow", "4": "faster"}[preset_choice]
 
-        # --- codec selection for modes 2-3 ---
-        print("\nКодек видео:")
-        print("  1. Автоматически: аппаратный кодек, если доступен, иначе libx265 (CPU) [по умолчанию]")
-        print("  2. hevc_videotoolbox (аппаратный HEVC, только macOS, использует QP)")
-        print("  3. libx265 (только процессор, медленно, точный CRF)")
-        codec_choice_w = prompt_menu("Выберите 1-3 [Enter = 1]: ", {"1", "2", "3"}, "1")
-        wizard_video_codec = "hevc_videotoolbox" if codec_choice_w == "2" else "x265"
-        # Option 3 is exactly --disable-hw-video: same auto path, HW forbidden.
-        wizard_disable_hw = codec_choice_w == "3"
-        if wizard_video_codec == "hevc_videotoolbox":
-            if not is_macos():
-                print("Ошибка: hevc_videotoolbox доступен только на macOS. Выберите x265.",
-                      file=sys.stderr)
-                return None
-            if not ffmpeg_supports_encoder("hevc_videotoolbox"):
-                print("Ошибка: ваш ffmpeg не поддерживает hevc_videotoolbox. "
-                      "Установите: brew install ffmpeg", file=sys.stderr)
-                return None
-            print("\nКачество q:v для hevc_videotoolbox (выше = качественнее и больше файл):")
-            print(f"  1. Осторожно (лучше качество, файл больше): q:v {VIDEOTOOLBOX_QP_PRESETS['1']}")
-            print(f"  2. Нормально (баланс): q:v {VIDEOTOOLBOX_QP_PRESETS['2']}")
-            print(f"  3. Сильно (меньше файл): q:v {VIDEOTOOLBOX_QP_PRESETS['3']}")
-            print("  4. Ввести вручную")
-            qp_choice_w = prompt_menu("Выберите 1-4 [Enter = 2]: ", {"1", "2", "3", "4"}, "2")
-            qp_presets_w = VIDEOTOOLBOX_QP_PRESETS
-            if qp_choice_w == "4":
-                wizard_video_qp = prompt_number("q:v (20-90, выше = больше файл): ", 20, 90)
-            else:
-                wizard_video_qp = qp_presets_w[qp_choice_w]
+    # --- codec selection ---
+    print("\nКодек видео:")
+    print("  1. Автоматически: аппаратный кодек, если доступен, иначе libx265 (CPU) [по умолчанию]")
+    print("  2. hevc_videotoolbox (аппаратный HEVC, только macOS, использует QP)")
+    print("  3. libx265 (только процессор, медленно, точный CRF)")
+    codec_choice_w = prompt_menu("Выберите 1-3 [Enter = 1]: ", {"1", "2", "3"}, "1")
+    wizard_video_codec = "hevc_videotoolbox" if codec_choice_w == "2" else "x265"
+    # Option 3 is exactly --disable-hw-video: same auto path, HW forbidden.
+    wizard_disable_hw = codec_choice_w == "3"
+    if wizard_video_codec == "hevc_videotoolbox":
+        if not is_macos():
+            print("Ошибка: hevc_videotoolbox доступен только на macOS. Выберите x265.",
+                  file=sys.stderr)
+            return None
+        if not ffmpeg_supports_encoder("hevc_videotoolbox"):
+            print("Ошибка: ваш ffmpeg не поддерживает hevc_videotoolbox. "
+                  "Установите: brew install ffmpeg", file=sys.stderr)
+            return None
+        print("\nКачество q:v для hevc_videotoolbox (выше = качественнее и больше файл):")
+        print(f"  1. Осторожно (лучше качество, файл больше): q:v {VIDEOTOOLBOX_QP_PRESETS['1']}")
+        print(f"  2. Нормально (баланс): q:v {VIDEOTOOLBOX_QP_PRESETS['2']}")
+        print(f"  3. Сильно (меньше файл): q:v {VIDEOTOOLBOX_QP_PRESETS['3']}")
+        print("  4. Ввести вручную")
+        qp_choice_w = prompt_menu("Выберите 1-4 [Enter = 2]: ", {"1", "2", "3", "4"}, "2")
+        qp_presets_w = VIDEOTOOLBOX_QP_PRESETS
+        if qp_choice_w == "4":
+            wizard_video_qp = prompt_number("q:v (20-90, выше = больше файл): ", 20, 90)
         else:
-            wizard_video_qp = 0
+            wizard_video_qp = qp_presets_w[qp_choice_w]
+    else:
+        wizard_video_qp = 0
 
     print("\nИтоговые настройки:")
     print(f"  Input: {input_dir}")
     print(f"  Output: {output_dir}")
     print(f"  Режим: {mode_name}")
-    if mode == "1":
-        print("  video_crf: не используется")
-        print("  video_preset: не используется")
-        print("  image_quality: не используется")
+    if wizard_video_codec == "hevc_videotoolbox":
+        print(f"  Кодек: hevc_videotoolbox, q:v={wizard_video_qp}")
+        print(f"  video_crf: {video_crf} (используется только для имён файлов)")
     else:
-        if wizard_video_codec == "hevc_videotoolbox":
-            print(f"  Кодек: hevc_videotoolbox, q:v={wizard_video_qp}")
-            print(f"  video_crf: {video_crf} (используется только для имён файлов)")
-        else:
-            # Resolve the encoder NOW so the real codec is visible before YES,
-            # not only after the run starts.
-            wizard_encoder = select_video_encoder(disable_hw=wizard_disable_hw)
-            for line in quality_mode_display(
-                wizard_encoder, video_crf, video_preset, explicit_qp=None
-            ):
-                print(line)
-            print(f"  video_crf: {video_crf}")
-            print(f"  video_preset: {video_preset}")
-        print(f"  image_quality: {image_quality}")
-        print(f"  show_ffmpeg_progress: {'да' if show_progress else 'нет'}")
-    print(f"  Dry-run: {'да' if mode == '2' else 'нет'}")
+        # Resolve the encoder NOW so the real codec is visible before YES,
+        # not only after the run starts.
+        wizard_encoder = select_video_encoder(disable_hw=wizard_disable_hw)
+        for line in quality_mode_display(
+            wizard_encoder, video_crf, video_preset, explicit_qp=None
+        ):
+            print(line)
+        print(f"  video_crf: {video_crf}")
+        print(f"  video_preset: {video_preset}")
+    print(f"  image_quality: {image_quality}")
+    print(f"  show_ffmpeg_progress: {'да' if show_progress else 'нет'}")
+    print(f"  Пробный прогон: {'да' if dry_run else 'нет'}")
     print("  Удаление файлов: выключено")
     confirmation = input("\nНапишите YES, чтобы начать: ").strip()
     if confirmation != "YES":
@@ -614,16 +598,15 @@ def run_wizard(args: argparse.Namespace) -> argparse.Namespace | None:
 
     args.input = input_dir
     args.output = output_dir
-    args.dry_run = mode == "2"
-    args.duplicates_only = mode == "1"
+    args.dry_run = dry_run
+    args.duplicates_only = False
     args.video_crf = video_crf
     args.video_preset = video_preset
     args.image_quality = image_quality
     args.show_ffmpeg_progress = show_progress
-    if mode != "1":
-        args.video_codec = wizard_video_codec
-        args.video_qp = wizard_video_qp
-        args.disable_hw_video = wizard_disable_hw
+    args.video_codec = wizard_video_codec
+    args.video_qp = wizard_video_qp
+    args.disable_hw_video = wizard_disable_hw
     return args
 
 
@@ -1384,8 +1367,18 @@ def run_undo_move_duplicates_mode(
     return 1 if errors else 0
 
 
-def run_wizard_quick_file(args: argparse.Namespace) -> argparse.Namespace | None:
-    while True:
+def run_wizard_quick_file(
+    args: argparse.Namespace, source: Path | None = None,
+) -> argparse.Namespace | None:
+    if source is not None and source.suffix.lower() not in VIDEO_EXTENSIONS:
+        print(f"Это не похоже на видеофайл (расширение «{source.suffix or 'без расширения'}»).")
+        if source.suffix.lower() in (SIMILAR_IMAGE_EXTENSIONS | COPY_IMAGE_EXTENSIONS | RAW_EXTENSIONS):
+            print("Для одного фото используйте пункт 6 (сжатие/конвертация фото).")
+            return None
+        if not prompt_yes_no("Всё равно попробовать сжать как видео? yes/no [no]: ", "no"):
+            print("Запуск отменён. Ничего не изменено.")
+            return None
+    while source is None:
         file_value = input("\nВставьте или перетащите видеофайл в Terminal: ")
         if not file_value.strip():
             print("Укажите путь к видеофайлу.")
