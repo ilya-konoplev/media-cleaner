@@ -70,6 +70,16 @@ class Counters:
     output_bytes: int = 0
 
 
+# hevc_videotoolbox -q:v is a quality knob: HIGHER = better quality and a
+# BIGGER file (the opposite of CRF).  Measured 2026-11-09 on an Apple M4 against
+# a 1080p30 HEVC Pixel clip at ~19.7 Mbit/s: q:v 60 -> 21.2 Mbit/s (+8%, larger
+# than the source), 50 -> 12.1 (-38%), 40 -> 9.1 (-54%), 30 -> 6.8 (-65%).
+# The old presets (50/60/70, "Сильно" = 70) were inverted and made every such
+# file come out larger, so the tool fell back to copying the original.
+VIDEOTOOLBOX_QP_PRESETS: dict[str, int] = {"1": 55, "2": 45, "3": 35}
+DEFAULT_VIDEOTOOLBOX_QP = VIDEOTOOLBOX_QP_PRESETS["2"]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -201,10 +211,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--video-qp", type=int, default=60, metavar="20..90",
+        "--video-qp", type=int, default=DEFAULT_VIDEOTOOLBOX_QP, metavar="20..90",
         help=(
-            "QP-качество для hevc_videotoolbox (20–90, по умолчанию: 60). "
-            "Игнорируется при --video-codec x265."
+            "Качество q:v для hevc_videotoolbox (20–90, по умолчанию: "
+            f"{DEFAULT_VIDEOTOOLBOX_QP}). ВЫШЕ = лучше качество и БОЛЬШЕ файл; "
+            "ниже = меньше файл. 60+ на исходниках с телефона часто даёт файл "
+            "больше оригинала. Игнорируется при --video-codec x265."
         ),
     )
     parser.add_argument(
@@ -555,15 +567,15 @@ def run_wizard(args: argparse.Namespace) -> argparse.Namespace | None:
                 print("Ошибка: ваш ffmpeg не поддерживает hevc_videotoolbox. "
                       "Установите: brew install ffmpeg", file=sys.stderr)
                 return None
-            print("\nКачество (QP для hevc_videotoolbox):")
-            print("  1. Осторожно (лучше качество): QP 50")
-            print("  2. Нормально (баланс): QP 60")
-            print("  3. Сильно (меньше файл): QP 70")
+            print("\nКачество q:v для hevc_videotoolbox (выше = качественнее и больше файл):")
+            print(f"  1. Осторожно (лучше качество, файл больше): q:v {VIDEOTOOLBOX_QP_PRESETS['1']}")
+            print(f"  2. Нормально (баланс): q:v {VIDEOTOOLBOX_QP_PRESETS['2']}")
+            print(f"  3. Сильно (меньше файл): q:v {VIDEOTOOLBOX_QP_PRESETS['3']}")
             print("  4. Ввести вручную")
             qp_choice_w = prompt_menu("Выберите 1-4 [Enter = 2]: ", {"1", "2", "3", "4"}, "2")
-            qp_presets_w = {"1": 50, "2": 60, "3": 70}
+            qp_presets_w = VIDEOTOOLBOX_QP_PRESETS
             if qp_choice_w == "4":
-                wizard_video_qp = prompt_number("QP (20-90): ", 20, 90)
+                wizard_video_qp = prompt_number("q:v (20-90, выше = больше файл): ", 20, 90)
             else:
                 wizard_video_qp = qp_presets_w[qp_choice_w]
         else:
@@ -956,7 +968,7 @@ def _validate_hevc_videotoolbox() -> int:
 
 def run_quick_file_mode(
     source: Path, video_crf: int, video_preset: str, dry_run: bool = False,
-    disable_hw: bool = False, video_codec: str = "x265", video_qp: int = 60,
+    disable_hw: bool = False, video_codec: str = "x265", video_qp: int = DEFAULT_VIDEOTOOLBOX_QP,
 ) -> int:
     source = source.expanduser().resolve()
     if not source.is_file() or source.is_symlink():
@@ -1414,15 +1426,15 @@ def run_wizard_quick_file(args: argparse.Namespace) -> argparse.Namespace | None
                   "Установите: brew install ffmpeg", file=sys.stderr)
             return None
 
-        print("\nКачество (QP для hevc_videotoolbox):")
-        print("  1. Осторожно (лучше качество): QP 50")
-        print("  2. Нормально (баланс): QP 60")
-        print("  3. Сильно (меньше файл): QP 70")
+        print("\nКачество q:v для hevc_videotoolbox (выше = качественнее и больше файл):")
+        print(f"  1. Осторожно (лучше качество, файл больше): q:v {VIDEOTOOLBOX_QP_PRESETS['1']}")
+        print(f"  2. Нормально (баланс): q:v {VIDEOTOOLBOX_QP_PRESETS['2']}")
+        print(f"  3. Сильно (меньше файл): q:v {VIDEOTOOLBOX_QP_PRESETS['3']}")
         print("  4. Ввести вручную")
         qp_choice = prompt_menu("Выберите 1-4 [Enter = 2]: ", {"1", "2", "3", "4"}, "2")
-        qp_presets = {"1": 50, "2": 60, "3": 70}
+        qp_presets = VIDEOTOOLBOX_QP_PRESETS
         if qp_choice == "4":
-            video_qp = prompt_number("QP (20-90): ", 20, 90)
+            video_qp = prompt_number("q:v (20-90, выше = больше файл): ", 20, 90)
         else:
             video_qp = qp_presets[qp_choice]
 
@@ -4604,7 +4616,7 @@ def build_video_command(
     preset: str,
     show_progress: bool,
     encoder: str,
-    qp: int = 60,
+    qp: int = DEFAULT_VIDEOTOOLBOX_QP,
 ) -> list[str]:
     """
     Build the complete ffmpeg argument list for video compression.
