@@ -84,6 +84,14 @@ pipx install "media-cleaner[heic] @ git+https://github.com/ilya-konoplev/media-c
 
 Закройте и снова откройте Terminal.
 
+pipx ставит **копию** программы, поэтому новые версии сами не подтягиваются. Чтобы обновиться, переустановите с флагом `--force` (той же командой, что ставили, — с extra, если он был):
+
+```bash
+pipx install --force git+https://github.com/ilya-konoplev/media-cleaner.git
+```
+
+Если правите код в локальной копии репозитория, переустанавливайте из неё: `pipx install --force .` в папке проекта.
+
 **4. Готово.** Теперь в любой папке достаточно набрать:
 
 ```bash
